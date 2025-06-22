@@ -19,3 +19,4 @@ nest_asyncio==1.5.5
 
 plotly
 streamlit-webrtc
+numpy
