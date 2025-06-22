@@ -1,6 +1,7 @@
 import google.genai as genai  # ← ここを修正
 from google.genai import types
 import os, wave, io
+import asyncio, queue
 import logging
 import base64
 from google.cloud import bigquery
@@ -98,6 +99,55 @@ class Gemini_TTS_Execution:
         return buf.getvalue()  # WAV ヘッダ + 音声
 
 
+class GeminiTTSStream:
+    """Vertex AI Gemini TTS を Live API で逐次ストリーミングする"""
+
+    def __init__(
+        self,
+        model: str = "gemini-2.5-pro-preview-tts",
+        voice_name: str = "Kore",
+    ):
+        try:
+            self.client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
+        except Exception as e:
+            logging.error(f"Error initializing Gemini client: {e}")
+            raise
+
+        # Live API 接続用設定を作成
+        self._config = types.LiveConnectConfig(
+            response_modalities=[
+                "AUDIO"
+            ],  # 音声のみを返す :contentReference[oaicite:1]{index=1}
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                        voice_name=voice_name  # Half-cascade で「Kore」などが利用可 :contentReference[oaicite:2]{index=2}
+                    )
+                )
+            ),
+        )
+        self._model = model
+
+    async def stream(self, text: str):
+        """
+        非同期ジェネレーター:
+        `for chunk in GeminiTTSStream().stream("hello"):` で
+        24 kHz / 16-bit PCM (bytes) を逐次取得
+        """
+        async with self.client.aio.live.connect(
+            model=self._model,
+            config=self._config,
+        ) as session:
+            # end_of_turn=True で即座に TTS 開始 :contentReference[oaicite:3]{index=3}
+            await session.send(input=text, end_of_turn=True)
+
+            # 1 turn 分のレスポンスを監視
+            turn = session.receive()
+            async for resp in turn:
+                if resp.data:  # AUDIO チャンク
+                    yield resp.data  # 50-100 ms 程度の PCM
+
+
 class GeminiChatExecution:
     """Vertex AI Gemini と対話するシンプルなチャットクラス"""
 
@@ -106,8 +156,6 @@ class GeminiChatExecution:
 
     def __init__(
         self,
-        project_id: str | None = None,
-        location: str | None = None,
         model_name: str | None = None,
         generation_config: GenerationConfig | None = None,
         system_prompt: str | None = None,  # ★ 追加: 初期システムプロンプト
@@ -191,6 +239,18 @@ class GeminiChatExecution:
         except Exception as e:
             logging.error(f"[GeminiChat] send_message error: {e}")
             raise
+
+    def send_audio(self, wav_bytes: bytes) -> str:
+        try:
+            audio_part = Part.from_data(mime_type="audio/wav", data=wav_bytes)
+            # ★ 修正: 音声と同時にテキストプロンプトも渡す
+            prompt_parts = ["この音声を日本語で文字に起こしてください。", audio_part]
+            # generate_content で STT（音声理解）を依頼
+            resp = self._model.generate_content(prompt_parts)
+            return resp.text
+        except Exception as e:
+            logging.error(f"[GeminiChat] send_audio error: {e}")
+            return f"音声認識エラー: {e}"
 
     # --------------------------------------------------------------------------
     # 履歴取得（デバッグ用）

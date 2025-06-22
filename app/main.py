@@ -25,12 +25,17 @@ import io
 import plotly.graph_objects as go
 import json
 
+# webrtc_audio_player.py
+import queue, threading, av, numpy as np
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, AudioProcessorBase
+
 # ======================  パス & イベントループ初期化  ======================
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(os.path.dirname(current_dir))
 if project_root not in sys.path:
     sys.path.append(project_root)
 from utils import Gemini_TTS_Execution, GeminiChatExecution
+from utils import GeminiTTSStream
 
 tts_executor = Gemini_TTS_Execution()
 
@@ -356,6 +361,8 @@ def main():
         st.session_state.chat_exec = GeminiChatExecution(
             system_prompt="あなたは親切な健康アドバイザーです。"
         )
+    if "mic_mode" not in st.session_state:  # ★★★ この行を追加 ★★★
+        st.session_state.mic_mode = False  # ★★★ この行を追加 ★★★
     st.title("ユーザー健康データ分析ダッシュボード 📊")
     # 👉 追加：チャット切り替えボタン
     if st.button("💬 チャット", key="toggle_chat"):
@@ -635,31 +642,49 @@ def main():
             "以下の情報をもとに、100文字程度で答えてください" + sys_ctx
         )
 
-    # 👉 追加：チャット UI（サイドバー）
+    # ==========================  サイドバー：チャット ======================
     if st.session_state.show_chat:
         with st.sidebar:
             st.header("🗣️ AI チャット")
 
-            # 0️⃣ トグルを最上部に配置（常に表示）
+            # 🔊 読み上げトグル
             tts_on = st.toggle("🔊 音声読み上げ", key="tts_on")
 
-            # 1️⃣ メッセージ表示エリア
+            # 🎤 マイク入力トグル
+            if st.button("🎤", key="toggle_mic", help="音声入力"):
+                st.session_state.mic_mode = not st.session_state.mic_mode
+
+            # ------------------- メッセージ表示 ----------------------------
             chat_area = st.container()
             with chat_area:
-                for msg in st.session_state.messages:
-                    with st.chat_message(msg["role"]):
-                        st.markdown(msg["content"])
+                for m in st.session_state.messages:
+                    with st.chat_message(m["role"]):
+                        st.markdown(m["content"])
 
-            # 2️⃣ 入力欄
-            if prompt := st.chat_input("メッセージを入力…"):
-                # -- ユーザー発話を追加
-                st.session_state.messages.append({"role": "user", "content": prompt})
+            # ------------------ 音声ウィジェット ---------------------------
+            audio_file = None
+            if st.session_state.mic_mode:
+                audio_file = st.audio_input("録音して送信", key="mic_rec")
+
+            # ------------------ 入力欄／送信処理 ---------------------------
+            prompt = st.chat_input("メッセージを入力…")
+            if prompt or audio_file is not None:
+                # ① ユーザ発話テキスト
+                if audio_file is not None:
+                    wav_bytes = audio_file.read()
+                    prompt_text = st.session_state.chat_exec.send_audio(wav_bytes)
+                else:
+                    prompt_text = prompt
+
+                st.session_state.messages.append(
+                    {"role": "user", "content": prompt_text}
+                )
                 with chat_area.chat_message("user"):
-                    st.markdown(prompt)
+                    st.markdown(prompt_text)
 
-                # -- Gemini 応答
+                # ② Gemini 応答
                 try:
-                    response = st.session_state.chat_exec.send_message(prompt)
+                    response = st.session_state.chat_exec.send_message(prompt_text)
                 except Exception as e:
                     response = f"モデル呼び出しエラー: {e}"
 
@@ -669,8 +694,8 @@ def main():
                 with chat_area.chat_message("assistant"):
                     st.markdown(response)
 
-                # 3️⃣ TTS はトグル状態を参照して実行
-                if st.session_state.tts_on:  # ← ここがポイント
+                # ③ 読み上げ
+                if st.session_state.tts_on:
                     wav = tts_executor.run_tts(response)
                     st.audio(wav, format="audio/wav", autoplay=True)
 
