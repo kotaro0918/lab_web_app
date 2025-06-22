@@ -30,7 +30,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(os.path.dirname(current_dir))
 if project_root not in sys.path:
     sys.path.append(project_root)
-from utils import Gemini_TTS_Execution
+from utils import Gemini_TTS_Execution, GeminiChatExecution
 
 tts_executor = Gemini_TTS_Execution()
 
@@ -60,6 +60,50 @@ try:
         user_records = json.load(fp)
 except FileNotFoundError:
     user_records = []
+
+
+def build_alert_context(
+    weekly_act: dict,
+    monthly_act: dict,
+    weekly_slp: dict,
+    monthly_slp: dict,
+    weekly_nut: dict,
+    monthly_nut: dict | None = None,  # 栄養は月次が無いケースも想定
+) -> str:
+    """
+    週次 / 月次 のアラートをまとめて 1 行文字列にするユーティリティ
+    """
+    parts: list[str] = []
+
+    # ── 週次 ─────────────────────────────
+    if weekly_act:
+        if weekly_act.get("weekly_step_alert"):
+            parts.append(f"週次 歩数アラート: {weekly_act['weekly_step_alert']}")
+        if weekly_act.get("weekly_active_alert"):
+            parts.append(f"週次 活動時間アラート: {weekly_act['weekly_active_alert']}")
+
+    if weekly_slp and weekly_slp.get("weekly_sleep_alert"):
+        parts.append(f"週次 睡眠時間アラート: {weekly_slp['weekly_sleep_alert']}")
+
+    if weekly_nut and weekly_nut.get("weekly_nutrition_alert"):
+        parts.append(f"週次 栄養アラート: {weekly_nut['weekly_nutrition_alert']}")
+
+    # ── 月次 ─────────────────────────────
+    if monthly_act:
+        if monthly_act.get("monthly_step_alert"):
+            parts.append(f"月次 歩数アラート: {monthly_act['monthly_step_alert']}")
+        if monthly_act.get("monthly_active_alert"):
+            parts.append(
+                f"月次 活動時間アラート: {monthly_act['monthly_active_alert']}"
+            )
+
+    if monthly_slp and monthly_slp.get("monthly_sleep_alert"):
+        parts.append(f"月次 睡眠時間アラート: {monthly_slp['monthly_sleep_alert']}")
+
+    if monthly_nut and monthly_nut.get("monthly_nutrition_alert"):
+        parts.append(f"月次 栄養アラート: {monthly_nut['monthly_nutrition_alert']}")
+
+    return " / ".join(parts) if parts else ""
 
 
 def get_user_profile(user_records, user_id: str):
@@ -302,7 +346,20 @@ def main():
     nest_asyncio.apply()  # Streamlit 再入ループ許可
 
     st.set_page_config(layout="wide")
+    # 👉 追加：チャット用の状態
+    if "show_chat" not in st.session_state:
+        st.session_state.show_chat = False  # チャットウィンドウの開閉
+    if "messages" not in st.session_state:
+        st.session_state.messages = []  # [{"role":"user/assistant","content":...}, ...]
+        # 👉 Gemini インスタンスを 1 回だけ生成
+    if "chat_exec" not in st.session_state:
+        st.session_state.chat_exec = GeminiChatExecution(
+            system_prompt="あなたは親切な健康アドバイザーです。"
+        )
     st.title("ユーザー健康データ分析ダッシュボード 📊")
+    # 👉 追加：チャット切り替えボタン
+    if st.button("💬 チャット", key="toggle_chat"):
+        st.session_state.show_chat = not st.session_state.show_chat
     user_ids = [
         "ashita03347@gmail.com",  # 運動不足　男性
         "ashita03626@gmail.com",  # 栄養不足,運動不足　男性　太り気味
@@ -329,6 +386,7 @@ def main():
                 ユーザープロファイル:
                 ---------------
                 (年齢: {user_profile.get('age', '不明')}, 性別: {user_profile.get('gender', '不明')}, BMI: {user_profile.get('bmi', '不明')})"""
+                st.session_state["user_info"] = user_info
             else:
                 user_info = ""
             try:
@@ -556,6 +614,65 @@ def main():
                 display_nutrition_data("先週の栄養データ", previous_nutrition_data)
     else:
         st.info('左上の"データを表示"ボタンを押して、分析を開始してください。')
+
+    # ---------- 1) session_state から安全に取得 ------------------
+    weekly_act = st.session_state.get("weekly_activity_result")
+    weekly_slp = st.session_state.get("weekly_sleep_result")
+    weekly_nut = st.session_state.get("weekly_nutrition_result")
+    monthly_act = st.session_state.get("monthly_activity_result")
+    monthly_slp = st.session_state.get("monthly_sleep_result")
+    monthly_nut = st.session_state.get("monthly_nutrition_result", {})  # 無ければ {}
+    user_info = st.session_state.get("user_info", "")
+
+    # ---------- 2) まだデータが無い場合は build&set をスキップ -----
+    if weekly_act and monthly_act:  # 他も None でないか確認
+        alert_ctx = build_alert_context(
+            weekly_act, monthly_act, weekly_slp, monthly_slp, weekly_nut, monthly_nut
+        )
+
+        sys_ctx = "\n".join(s for s in [user_info, alert_ctx] if s)
+        st.session_state.chat_exec.set_system_prompt(
+            "以下の情報をもとに、100文字程度で答えてください" + sys_ctx
+        )
+
+    # 👉 追加：チャット UI（サイドバー）
+    if st.session_state.show_chat:
+        with st.sidebar:
+            st.header("🗣️ AI チャット")
+
+            # 0️⃣ トグルを最上部に配置（常に表示）
+            tts_on = st.toggle("🔊 音声読み上げ", key="tts_on")
+
+            # 1️⃣ メッセージ表示エリア
+            chat_area = st.container()
+            with chat_area:
+                for msg in st.session_state.messages:
+                    with st.chat_message(msg["role"]):
+                        st.markdown(msg["content"])
+
+            # 2️⃣ 入力欄
+            if prompt := st.chat_input("メッセージを入力…"):
+                # -- ユーザー発話を追加
+                st.session_state.messages.append({"role": "user", "content": prompt})
+                with chat_area.chat_message("user"):
+                    st.markdown(prompt)
+
+                # -- Gemini 応答
+                try:
+                    response = st.session_state.chat_exec.send_message(prompt)
+                except Exception as e:
+                    response = f"モデル呼び出しエラー: {e}"
+
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": response}
+                )
+                with chat_area.chat_message("assistant"):
+                    st.markdown(response)
+
+                # 3️⃣ TTS はトグル状態を参照して実行
+                if st.session_state.tts_on:  # ← ここがポイント
+                    wav = tts_executor.run_tts(response)
+                    st.audio(wav, format="audio/wav", autoplay=True)
 
 
 # ============================  プロファイラ  ===============================
