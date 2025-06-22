@@ -1,11 +1,15 @@
-import pandas as pd
-import numpy as np
 import os
 import sys
-from tqdm import tqdm
 from datetime import datetime
+import asyncio
+import pandas as pd
+import numpy as np
+from tqdm import tqdm
 
+# ルートパスを追加
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+
+# アプリ依存モジュール
 from app.jobs.sleep import get_sleep_by_user, get_random_sleep_users
 from app.gemini.generate_alert import (
     generate_monthly_sleep_alert,
@@ -13,30 +17,29 @@ from app.gemini.generate_alert import (
 )
 
 
-def weekly_sleep_pipeline(user_id, today):
+# --------------------------------------------------------------------------- #
+#                             非同期パイプライン
+# --------------------------------------------------------------------------- #
+async def weekly_sleep_pipeline(
+    user_id: str, today: datetime, user_profile: str = ""
+) -> dict:
     """
-    ユーザーの睡眠データを処理し、アラートを生成するパイプライン関数
-    Args:
-        user_id (str): ユーザーID
-        today (datetime): 処理日
-    Returns:
-        dict: 処理結果を含む辞書
+    1 週間分の睡眠データを取得し、週次アラートを生成する。
     """
-    # 1週間前の日付を計算
     one_week_ago = today - pd.DateOffset(weeks=1)
     end_date = today - pd.DateOffset(days=1)
 
-    current_sleep_data = get_sleep_by_user(user_id, one_week_ago, end_date)
-    # 平均値の計算
-    current_sleep_mean = (
-        np.mean(current_sleep_data["total_minutes_asleep"])
-        if current_sleep_data["total_minutes_asleep"]
-        else 0
+    # 同期関数をスレッドへ
+    current_sleep_data = await asyncio.to_thread(
+        get_sleep_by_user, user_id, one_week_ago, end_date
     )
-    # アラートの生成
-    weekly_sleep_alert = generate_weekly_sleep_alert(
-        current_sleep_data["total_minutes_asleep"],
-        current_sleep_mean,
+
+    current_sleep_values = [
+        x for x in current_sleep_data["total_minutes_asleep"] if x > 0
+    ]
+    current_sleep_mean = np.mean(current_sleep_values) if current_sleep_values else 0
+    weekly_sleep_alert = await generate_weekly_sleep_alert(
+        current_sleep_data["total_minutes_asleep"], current_sleep_mean, user_profile
     )
 
     return {
@@ -48,30 +51,26 @@ def weekly_sleep_pipeline(user_id, today):
     }
 
 
-def monthly_sleep_pipeline(user_id, today):
+async def monthly_sleep_pipeline(
+    user_id: str, today: datetime, user_profile: str = ""
+) -> dict:
     """
-    ユーザーの睡眠データを処理し、アラートを生成するパイプライン関数
-    Args:
-        user_id (str): ユーザーID
-        today (datetime): 処理日
-    Returns:
-        dict: 処理結果を含む辞書
+    1 か月分の睡眠データを取得し、月次アラートを生成する。
     """
-    # 1ヶ月前の日付を計算
     one_month_ago = today - pd.DateOffset(months=1)
     end_date = today - pd.DateOffset(days=1)
 
-    current_sleep_data = get_sleep_by_user(user_id, one_month_ago, end_date)
-    # 平均値の計算
-    current_sleep_mean = (
-        np.mean(current_sleep_data["total_minutes_asleep"])
-        if current_sleep_data["total_minutes_asleep"]
-        else 0
+    current_sleep_data = await asyncio.to_thread(
+        get_sleep_by_user, user_id, one_month_ago, end_date
     )
-    # アラートの生成
-    monthly_sleep_alert = generate_monthly_sleep_alert(
-        current_sleep_data["total_minutes_asleep"],
-        current_sleep_mean,
+
+    current_sleep_values = [
+        x for x in current_sleep_data["total_minutes_asleep"] if x > 0
+    ]
+    current_sleep_mean = np.mean(current_sleep_values) if current_sleep_values else 0
+
+    monthly_sleep_alert = await generate_monthly_sleep_alert(
+        current_sleep_data["total_minutes_asleep"], current_sleep_mean, user_profile
     )
 
     return {
@@ -83,19 +82,35 @@ def monthly_sleep_pipeline(user_id, today):
     }
 
 
-if __name__ == "__main__":
-    # 例として、2024年4月1日を処理日とする
+# --------------------------------------------------------------------------- #
+#                               テスト実行ブロック
+# --------------------------------------------------------------------------- #
+async def _test():
+    """
+    ランダムユーザー 1 名で週次・月次パイプラインを並列実行して結果を表示。
+    """
     today = datetime(2024, 6, 1)
-    # ランダムなユーザーIDを取得
-    user_id = get_random_sleep_users(
-        limit=1,
-        min_records=20,
-        start_date=today - pd.DateOffset(month=1),
-        end_date=today,
+
+    user_id = (
+        await asyncio.to_thread(
+            get_random_sleep_users,
+            limit=1,
+            min_records=20,
+            start_date=today - pd.DateOffset(months=1),
+            end_date=today,
+        )
     )[0]
-    # 週間睡眠パイプラインを実行
-    weekly_sleep_result = weekly_sleep_pipeline(user_id, today)
-    print(weekly_sleep_result)
-    # 月間睡眠パイプラインを実行
-    monthly_sleep_result = monthly_sleep_pipeline(user_id, today)
-    print(monthly_sleep_result)
+
+    weekly_result, monthly_result = await asyncio.gather(
+        weekly_sleep_pipeline(user_id, today),
+        monthly_sleep_pipeline(user_id, today),
+    )
+
+    print("=== Weekly Sleep Pipeline Result ===")
+    print(weekly_result)
+    print("\n=== Monthly Sleep Pipeline Result ===")
+    print(monthly_result)
+
+
+if __name__ == "__main__":
+    asyncio.run(_test())

@@ -1,121 +1,231 @@
+# main.py の最上部などに一度だけ入れる
+import sys, google, pprint
+
+print("Python →", sys.executable)  # ← venv/python になっているか
+print("google.__path__ →", list(google.__path__))  # site-packages だけなら OK
+try:
+    import google.genai as genai
+
+    print("google-genai", genai.__version__)
+except ImportError as e:
+    print("ImportError:", e)
+
+
+# main.py  ────────────────────────────────────────────────────────────────
 import streamlit as st
-import sys
 import os
 from datetime import datetime
 from pathlib import Path
 import pandas as pd
 import asyncio
 import nest_asyncio
-import cProfile  # ★ cProfileモジュールをインポート
-import pstats  # ★ pstatsモジュールをインポート (結果整形用)
-import io  # ★ pstatsの結果を文字列として扱うためにインポート
+import cProfile
+import pstats
+import io
+import plotly.graph_objects as go
+import json
 
-
-# ---------- イベントループ初期化 ----------
-def ensure_event_loop():
-    """
-    ScriptRunner.scriptThread にはデフォルトのイベントループが無いので、
-    無ければ生成して set_event_loop した上で nest_asyncio.apply() を呼ぶ。
-    """
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:  # まだループが無い
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    # nest_asyncio.apply() は ensure_event_loop を呼び出す側、またはmainの最初で行うのが一般的
-    # ここではmainの最初で呼び出すことにします。
-
-
-# ---------- パス設定 ----------
-# スクリプトの場所に基づいて適切に設定してください
+# ======================  パス & イベントループ初期化  ======================
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(os.path.dirname(current_dir))
 if project_root not in sys.path:
     sys.path.append(project_root)
+from utils import Gemini_TTS_Execution
 
-# 非同期ヘルパー (async_utils.py が適切な場所にあることを確認してください)
+tts_executor = Gemini_TTS_Execution()
+
+
+def ensure_event_loop():
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+
+# =========  パイプライン（すべて async 版） & async ヘルパー  ==============
+from pipeline.activity_pipeline import (
+    weekly_activity_pipeline,
+    monthly_activity_pipeline,
+)
+from pipeline.sleep_pipeline import weekly_sleep_pipeline, monthly_sleep_pipeline
+from pipeline.nutrition_pipeline import weekly_nutrition_pipeline
+from app.jobs.sleep import get_random_sleep_users  # UI で未使用だが保持
+
+import time
+import inspect
+
 try:
-    from async_utils import fetch_all
-except ImportError:
-    st.error("async_utils.py が見つかりません。パス設定を確認してください。")
-    st.stop()  # fetch_allがないと動作しないため停止
+    with open("data/user_profile.json", "r", encoding="utf-8") as fp:
+        user_records = json.load(fp)
+except FileNotFoundError:
+    user_records = []
 
-# -----------------  フィードバック収集ユーティリティ  -----------------
+
+def get_user_profile(user_records, user_id: str):
+    match = next(  # │
+        (rec for rec in user_records if rec["id"] == user_id),
+        None,  # ← target_id → user_id
+    )
+
+    if match is None:
+        print("ユーザーが見つかりません")
+        return None
+
+    profile = {k: match[k] for k in ("age", "gender", "bmi")}  # dict で返す例
+    return profile  # 呼び出し元で使うなら返しておく
+
+
+async def _run_pipeline_with_timing(pipeline_name, pipeline_func, *args):
+    """
+    非同期パイプラインを計測しつつ実行。
+    同期関数が渡された場合は to_thread でオフロード。
+    """
+    start = time.perf_counter()
+    print(f"[計測] {pipeline_name} 開始")
+
+    try:
+        if inspect.iscoroutinefunction(pipeline_func):
+            result = await pipeline_func(*args)
+        else:  # 念のため同期関数も扱える汎用化
+            result = await asyncio.to_thread(pipeline_func, *args)
+        print(f"[計測] {pipeline_name} 完了 ({time.perf_counter() - start:.3f}s)")
+        return result
+    except Exception as e:
+        print(
+            f"[計測] {pipeline_name} 例外 ({time.perf_counter() - start:.3f}s): {e!r}"
+        )
+        raise
+
+
+async def fetch_all(user_id: str, today: datetime, user_profile: str = ""):
+    overall_start = time.perf_counter()
+    print(f"[fetch_all] パイプライン開始 for {user_id}")
+
+    # 各パイプラインの同時実行
+    tasks = [
+        _run_pipeline_with_timing(
+            "weekly_activity", weekly_activity_pipeline, user_id, today, user_profile
+        ),
+        _run_pipeline_with_timing(
+            "weekly_sleep", weekly_sleep_pipeline, user_id, today, user_profile
+        ),
+        _run_pipeline_with_timing(
+            "weekly_nutrition",
+            weekly_nutrition_pipeline,
+            user_id.replace("@gmail.com", ""),  # nutrition だけ ID 仕様が異なる想定
+            today,
+            user_profile,
+        ),
+        _run_pipeline_with_timing(
+            "monthly_activity", monthly_activity_pipeline, user_id, today, user_profile
+        ),
+        _run_pipeline_with_timing(
+            "monthly_sleep", monthly_sleep_pipeline, user_id, today, user_profile
+        ),
+    ]
+
+    results = await asyncio.gather(*tasks, return_exceptions=False)
+    print(
+        f"[fetch_all] 全パイプライン完了 ({time.perf_counter() - overall_start:.3f}s)"
+    )
+    return tuple(results)
+
+
+# ===================  フィードバック & グラフ描画ユーティリティ  =============
 FEEDBACK_FILE = "feedback.csv"
 
 
-def save_feedback(user_id: str, message_id: str, rating: int):
-    """CSV に追記保存（初回はヘッダ付きで作成）"""
+def save_feedback(user_id, message_id, rating):
     df = pd.DataFrame(
         [
             {
                 "timestamp": datetime.now().isoformat(timespec="seconds"),
                 "user_id": user_id,
                 "message_id": message_id,
-                "rating": rating,  # 👍 = 1, 👎 = 0
+                "rating": rating,
             }
         ]
     )
-    # ファイル存在チェックのPathオブジェクト生成を最適化するなら、
-    # アプリ起動時に一度だけ存在確認し、結果をst.session_stateに持つなども考えられる
-    feedback_file_path = Path(FEEDBACK_FILE)
-    df.to_csv(
-        feedback_file_path,
-        mode="a",
-        header=not feedback_file_path.exists(),
-        index=False,
-    )
+    path = Path(FEEDBACK_FILE)
+    df.to_csv(path, mode="a", header=not path.exists(), index=False)
 
 
-def rated_info(message_id: str, text: str, user_id: str):
-    """
-    st.info() の横に 👍 / 👎 ボタンを付け、結果を保存
-    """
+def rated_info(message_id, text, user_id):
     if "ratings" not in st.session_state:
         st.session_state["ratings"] = {}
 
-    disabled_flag = message_id in st.session_state["ratings"]
+    # 8:1:1:1 → 本文 / 再生 / 👍 / 👎
+    col_msg, col_play, col_like, col_dislike = st.columns([8, 0.5, 0.5, 0.5])
 
-    col_msg, col_like, col_dislike = st.columns([8, 1, 1])
     with col_msg:
-        st.info(text)
+        st.markdown(
+            f"""
+            <div style="padding:1em;background-color:#e1f5fe;border-left:4px solid #29b6f6;border-radius:4px;">
+                <span style="font-size:25px;">{text}</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-    like_clicked = col_like.button(
-        "👍", key=f"like_{message_id}", disabled=disabled_flag, help="参考になった"
-    )
-    dislike_clicked = col_dislike.button(
-        "👎",
-        key=f"dislike_{message_id}",
-        disabled=disabled_flag,
-        help="参考にならなかった",
-    )
+    # ▶ ボタン
+    if col_play.button("▶️", key=f"play_{message_id}"):
+        with st.spinner("音声を生成中…"):
+            wav = tts_executor.run_tts(text)
+        st.session_state[f"audio_{message_id}"] = wav  # キャッシュ
 
-    if like_clicked or dislike_clicked:
-        rating_val = 1 if like_clicked else 0
-        st.session_state["ratings"][message_id] = rating_val
-        save_feedback(user_id, message_id, rating_val)
+    # 再生プレーヤー（自動再生 ON）
+    if f"audio_{message_id}" in st.session_state:
+        col_play.audio(
+            st.session_state[f"audio_{message_id}"],
+            format="audio/wav",
+            autoplay=True,  # ★ これだけ
+        )
+
+    # 👍 / 👎 は既存処理
+    disabled = message_id in st.session_state["ratings"]
+    if col_like.button("👍", key=f"like_{message_id}", disabled=disabled):
+        st.session_state["ratings"][message_id] = 1
+        save_feedback(user_id, message_id, 1)
+        st.toast("フィードバックありがとうございます！", icon="✅")
+    if col_dislike.button("👎", key=f"dislike_{message_id}", disabled=disabled):
+        st.session_state["ratings"][message_id] = 0
+        save_feedback(user_id, message_id, 0)
         st.toast("フィードバックありがとうございます！", icon="✅")
 
 
-# -------- ヘルパー関数 --------
+# ---- 活動量データ表示 ---------------------------------------------------
 def display_activity_data(title, activity_data, key_suffix=""):
     if activity_data and activity_data.get("dates"):
-        # DataFrame生成を最適化するなら、元データの日付が既にdatetime型なら変換不要
         df = pd.DataFrame(
             {
                 "Date": pd.to_datetime(activity_data["dates"]),
                 "Steps": activity_data.get("steps", []),
-                "Activity Minutes": activity_data.get("activity_minutes", []),
+                "座位時間": activity_data.get("sedentary_minutes", []),
             }
-        ).set_index("Date")
-        st.subheader(f"{title} - Steps")
-        st.line_chart(df["Steps"])
-        st.subheader(f"{title} - Activity Minutes")
-        st.line_chart(df["Activity Minutes"])
+        )
+
+        for col in ["Steps", "座位時間"]:
+            fig = go.Figure()
+            fig.add_trace(
+                go.Scatter(x=df["Date"], y=df[col], mode="lines+markers", name=col)
+            )
+            fig.update_layout(
+                title=f"{title} - {col}",
+                title_font_size=24,
+                font=dict(size=22),
+                xaxis=dict(
+                    title="Date", title_font=dict(size=22), tickfont=dict(size=18)
+                ),
+                yaxis=dict(title=col, title_font=dict(size=22), tickfont=dict(size=18)),
+                height=450,
+            )
+            st.plotly_chart(fig, use_container_width=True)
     else:
         st.write(f"{title}: データがありません。")
 
 
+# ---- 睡眠データ表示 -----------------------------------------------------
 def display_sleep_data(title, sleep_data, key_suffix=""):
     if sleep_data and sleep_data.get("dates"):
         df = pd.DataFrame(
@@ -123,15 +233,29 @@ def display_sleep_data(title, sleep_data, key_suffix=""):
                 "Date": pd.to_datetime(sleep_data["dates"]),
                 "Total Minutes Asleep": sleep_data.get("total_minutes_asleep", []),
             }
-        ).set_index("Date")
-        st.subheader(f"{title} - Total Minutes Asleep")
-        st.line_chart(df["Total Minutes Asleep"])
+        )
+
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatter(x=df["Date"], y=df["Total Minutes Asleep"], mode="lines+markers")
+        )
+        fig.update_layout(
+            title=f"{title} - Total Minutes Asleep",
+            title_font_size=24,
+            font=dict(size=22),
+            xaxis=dict(title="Date", title_font=dict(size=22), tickfont=dict(size=18)),
+            yaxis=dict(
+                title="Minutes", title_font=dict(size=22), tickfont=dict(size=18)
+            ),
+            height=450,
+        )
+        st.plotly_chart(fig, use_container_width=True)
     else:
         st.write(f"{title}: データがありません。")
 
 
+# ---- 栄養データ表示 -----------------------------------------------------
 def display_nutrition_data(title, nutrition_data, key_suffix=""):
-    """栄養データをグラフ表示するヘルパー関数"""
     dates_raw = nutrition_data.get("dates", [])
     if not dates_raw:
         st.write(f"{title}: データがありません。")
@@ -146,99 +270,88 @@ def display_nutrition_data(title, nutrition_data, key_suffix=""):
         "protein": "protein",
         "lipid": "lipid",
         "dietary_fiber": "dietary_fiber",
+        "protein_ratio": "protein_ratio",
     }
 
-    for field, col_name in field_map.items():
-        values = nutrition_data.get(field, [])
-        # len(values) が len(dates) と異なる場合の処理も考慮
-        if values and len(values) == len(dates):
-            df[col_name] = values
-        elif values:  # データはあるが長さが異なる場合 (エラーまたは補間処理など検討)
-            df[col_name] = pd.Series(
-                values,
-                index=dates[: len(values)] if len(values) < len(dates) else dates,
-            )  # 一例
-        else:
-            df[col_name] = float("nan")  # または pd.NA
+    for field, col in field_map.items():
+        vals = nutrition_data.get(field, [])
+        df[col] = pd.Series(vals, index=dates[: len(vals)])
 
     for col in df.columns:
-        if not df[col].isnull().all():  # or df[col].notna().any()
-            st.subheader(f"{title} - {col.replace('_', ' ').title()}")
-            st.line_chart(df[col].dropna())  # NaNをグラフ描画前に除外
+        if df[col].notna().any():
+            fig = go.Figure()
+            fig.add_trace(
+                go.Scatter(x=df.index, y=df[col], mode="lines+markers", name=col)
+            )
+            fig.update_layout(
+                title=f"{title} - {col}",
+                title_font_size=24,
+                font=dict(size=22),
+                xaxis=dict(
+                    title="Date", title_font=dict(size=22), tickfont=dict(size=18)
+                ),
+                yaxis=dict(title=col, title_font=dict(size=22), tickfont=dict(size=18)),
+                height=450,
+            )
+            st.plotly_chart(fig, use_container_width=True)
 
 
+# ============================  Streamlit  ===================================
 def main():
-    """Streamlitアプリケーションのメインロジック"""
-    ensure_event_loop()  # イベントループの初期化
-    nest_asyncio.apply()  # ループ再入可能化
+    ensure_event_loop()
+    nest_asyncio.apply()  # Streamlit 再入ループ許可
 
-    # ---------- 画面設定 ----------
     st.set_page_config(layout="wide")
     st.title("ユーザー健康データ分析ダッシュボード 📊")
-
-    # ---------- ユーザー選択 ----------
     user_ids = [
-        "ashita14977@gmail.com",
-        "ashita02057@gmail.com",
-        "ashita15607@gmail.com",
-        "ashita03841@gmail.com",
-        "ashita02063@gmail.com",
-        "ashita02981@gmail.com",
-        "ashita15019@gmail.com",
-        "ashita03168@gmail.com",
+        "ashita03347@gmail.com",  # 運動不足　男性
+        "ashita03626@gmail.com",  # 栄養不足,運動不足　男性　太り気味
+        "ashita14866@gmail.com",  # 栄養不足,運動不足　男性
+        "ashita01062@gmail.com",  # 運動不足 女性
     ]
-    user_id_input = st.selectbox(
-        "ユーザーIDを選択してください:", user_ids, key="user_id_selector"
-    )
+    uid = st.selectbox("ユーザーIDを選択してください:", user_ids)
+    today = datetime(2024, 2, 19)
+    st.sidebar.info(f"基準日: {today:%Y-%m-%d}")
 
-    # ---------- 日付設定 ----------
-    # この日付はデモ用に固定されています。動的に変更する場合は st.date_input などを検討。
-    today = datetime(2024, 4, 7)
-    st.sidebar.info(f"基準日: {today.strftime('%Y-%m-%d')}")
-
-    # ================== データ取得ボタン ==================
-    if st.button("データを表示", key="show_data_button"):
-        if not user_id_input:
+    if st.button("データを表示"):
+        if not uid:
             st.error("ユーザーIDを入力してください。")
             st.stop()
 
-        st.session_state["user_id"] = user_id_input
-
+        st.session_state["user_id"] = uid
         loop = asyncio.get_event_loop()
+
         with st.spinner("パイプライン実行中…"):
+            user_profile = get_user_profile(user_records, uid)
+            if user_profile is not None:
+                user_info = f"""
+                以下のユーザープロファイルを考慮して、最適化された健康アドバイスを生成してください。
+                ユーザープロファイル:
+                ---------------
+                (年齢: {user_profile.get('age', '不明')}, 性別: {user_profile.get('gender', '不明')}, BMI: {user_profile.get('bmi', '不明')})"""
+            else:
+                user_info = ""
             try:
-                (
-                    weekly_activity_result,
-                    weekly_sleep_result,
-                    weekly_nutrition_result,
-                    monthly_activity_result,
-                    monthly_sleep_result,
-                ) = loop.run_until_complete(fetch_all(user_id_input, today))
+                (weekly_act, weekly_slp, weekly_nut, monthly_act, monthly_slp) = (
+                    loop.run_until_complete(fetch_all(uid, today, user_info))
+                )
             except Exception as e:
                 st.error(f"パイプライン実行中にエラーが発生しました: {e}")
-                # 詳細なエラー情報をログに出力することも検討
-                # import traceback
-                # st.error(traceback.format_exc())
                 st.stop()
 
         st.session_state.update(
             {
-                "weekly_activity_result": weekly_activity_result,
-                "weekly_sleep_result": weekly_sleep_result,
-                "weekly_nutrition_result": weekly_nutrition_result,
-                "monthly_activity_result": monthly_activity_result,
-                "monthly_sleep_result": monthly_sleep_result,
+                "weekly_activity_result": weekly_act,
+                "weekly_sleep_result": weekly_slp,
+                "weekly_nutrition_result": weekly_nut,
+                "monthly_activity_result": monthly_act,
+                "monthly_sleep_result": monthly_slp,
             }
         )
-        # セッションステートにデータが入ったことを確認するためにキーをリセットする（再描画を促す場合）
-        # st.experimental_rerun() # もし必要なら
 
-    # =====================================================
-
-    # session_state に結果がある場合にのみ UI を描画
+    # -----------  結果表示（元 UI そのまま） -------------------------------
     if "weekly_activity_result" in st.session_state:
         uid = st.session_state["user_id"]
-
         weekly_activity_result = st.session_state["weekly_activity_result"]
         weekly_sleep_result = st.session_state["weekly_sleep_result"]
         weekly_nutrition_result = st.session_state["weekly_nutrition_result"]
@@ -246,188 +359,212 @@ def main():
         monthly_sleep_result = st.session_state["monthly_sleep_result"]
 
         st.header(f"ユーザー: {uid} の分析結果")
-        tab_titles = ["📅 週次レポート", "🗓️ 月次レポート", "栄養レポート"]
-        tab1, tab2, tab3 = st.tabs(tab_titles)
+        tab1, tab2, tab3 = st.tabs(
+            ["📅 週次レポート", "🗓️ 月次レポート", "栄養レポート"]
+        )
 
         with tab1:
             st.subheader("活動データ (週次) 🏃‍♀️")
             rated_info(
                 "weekly_step_alert",
-                f"歩数アラート: {weekly_activity_result.get('weekly_step_alert', 'N/A')}",
+                f"歩数アラート: {weekly_activity_result.get('weekly_step_alert','N/A')}",
                 uid,
             )
             rated_info(
                 "weekly_active_alert",
-                f"活動時間アラート: {weekly_activity_result.get('weekly_active_alert', 'N/A')}",
+                f"活動時間アラート: {weekly_activity_result.get('weekly_active_alert','N/A')}",
                 uid,
             )
             st.divider()
-            current_activity_data = weekly_activity_result.get("current_activity_data")
-            previous_activity_data = weekly_activity_result.get(
-                "previous_activity_data"
-            )
             col1, col2 = st.columns(2)
             with col1:
                 st.metric(
-                    label="今週の平均歩数",
-                    value=f"{weekly_activity_result.get('current_steps_mean', 0):.0f} 歩",
+                    "今週の平均歩数",
+                    f"{weekly_activity_result.get('current_steps_mean',0):.0f} 歩",
+                )
+                st.metric(
+                    "今週の平均座位時間",
+                    f"{weekly_activity_result.get('current_sedentary_mean',0):.0f} 分",
                 )
                 display_activity_data(
-                    "今週の活動データ", current_activity_data, "weekly_current_activity"
+                    "今週の活動データ",
+                    weekly_activity_result.get("current_activity_data"),
                 )
             with col2:
                 st.metric(
-                    label="先週の平均歩数",
-                    value=f"{weekly_activity_result.get('previous_steps_mean', 0):.0f} 歩",
+                    "先週の平均歩数",
+                    f"{weekly_activity_result.get('previous_steps_mean',0):.0f} 歩",
+                )
+                st.metric(
+                    "先週の平均座位時間",
+                    f"{weekly_activity_result.get('previous_sedentary_mean',0):.0f} 分",
                 )
                 display_activity_data(
                     "先週の活動データ",
-                    previous_activity_data,
-                    "weekly_previous_activity",
+                    weekly_activity_result.get("previous_activity_data"),
                 )
             st.divider()
-            col1, col2 = st.columns(2)  # レイアウト調整のため再定義
+            col1, col2 = st.columns(2)
             with col1:
                 st.metric(
-                    label="今週の平均活動時間",
-                    value=f"{weekly_activity_result.get('current_activity_mean', 0):.0f} 分",
+                    "今週の平均活動時間",
+                    f"{weekly_activity_result.get('current_activity_mean',0):.0f} 分",
                 )
             with col2:
                 st.metric(
-                    label="先週の平均活動時間",
-                    value=f"{weekly_activity_result.get('previous_activity_mean', 0):.0f} 分",
+                    "先週の平均活動時間",
+                    f"{weekly_activity_result.get('previous_activity_mean',0):.0f} 分",
                 )
             st.divider()
             st.subheader("睡眠データ (週次) 😴")
             rated_info(
                 "weekly_sleep_alert",
-                f"睡眠時間アラート: {weekly_sleep_result.get('weekly_sleep_alert', 'N/A')}",
+                f"睡眠時間アラート: {weekly_sleep_result.get('weekly_sleep_alert','N/A')}",
                 uid,
             )
             st.divider()
-            current_sleep_data = weekly_sleep_result.get("current_sleep_data")
-            col1, _ = st.columns(2)  # レイアウト調整のため再定義
-            with col1:
-                st.metric(
-                    label="今週の平均睡眠時間",
-                    value=f"{weekly_sleep_result.get('current_sleep_mean', 0):.0f} 分",
-                )
-                display_sleep_data(
-                    "今週の睡眠データ", current_sleep_data, "weekly_current_sleep"
-                )
+            st.metric(
+                "今週の平均睡眠時間",
+                f"{weekly_sleep_result.get('current_sleep_mean',0):.0f} 分",
+            )
+            display_sleep_data(
+                "今週の睡眠データ", weekly_sleep_result.get("current_sleep_data")
+            )
 
         with tab2:
             st.subheader("活動データ (月次) 🏃‍♂️")
             rated_info(
                 "monthly_step_alert",
-                f"月次 歩数アラート: {monthly_activity_result.get('monthly_step_alert', 'N/A')}",
+                f"月次 歩数アラート: {monthly_activity_result.get('monthly_step_alert','N/A')}",
                 uid,
             )
             rated_info(
                 "monthly_active_alert",
-                f"月次 活動時間アラート: {monthly_activity_result.get('monthly_active_alert', 'N/A')}",
+                f"月次 活動時間アラート: {monthly_activity_result.get('monthly_active_alert','N/A')}",
                 uid,
             )
             st.divider()
-            current_monthly_activity_data = monthly_activity_result.get(
-                "current_activity_data"
+            st.metric(
+                "今月の平均歩数",
+                f"{monthly_activity_result.get('current_steps_mean',0):.0f} 歩",
             )
             st.metric(
-                label="今月の平均歩数",
-                value=f"{monthly_activity_result.get('current_steps_mean', 0):.0f} 歩",
-            )
-            st.metric(
-                label="今月の平均活動時間",
-                value=f"{monthly_activity_result.get('current_activity_mean', 0):.0f} 分",
+                "今月の平均Sedentary Minutes",
+                f"{monthly_activity_result.get('current_activity_mean',0):.0f} 分",
             )
             display_activity_data(
-                "今月の活動データ",
-                current_monthly_activity_data,
-                "monthly_current_activity",
+                "今月の活動データ", monthly_activity_result.get("current_activity_data")
             )
             st.divider()
             st.subheader("睡眠データ (月次) 🛌")
             rated_info(
                 "monthly_sleep_alert",
-                f"月次 睡眠時間アラート: {monthly_sleep_result.get('monthly_sleep_alert', 'N/A')}",
+                f"月次 睡眠時間アラート: {monthly_sleep_result.get('monthly_sleep_alert','N/A')}",
                 uid,
             )
             st.divider()
-            current_monthly_sleep_data = monthly_sleep_result.get("current_sleep_data")
             st.metric(
-                label="今月の平均睡眠時間",
-                value=f"{monthly_sleep_result.get('current_sleep_mean', 0):.0f} 分",
+                "今月の平均睡眠時間",
+                f"{monthly_sleep_result.get('current_sleep_mean',0):.0f} 分",
             )
             display_sleep_data(
-                "今月の睡眠データ", current_monthly_sleep_data, "monthly_current_sleep"
+                "今月の睡眠データ", monthly_sleep_result.get("current_sleep_data")
             )
 
         with tab3:
             st.subheader("栄養データ (週次) 🍽️")
             rated_info(
                 "weekly_nutrition_alert",
-                f"栄養アラート: {weekly_nutrition_result.get('weekly_nutrition_alert', 'N/A')}",
+                f"栄養アラート: {weekly_nutrition_result.get('weekly_nutrition_alert','N/A')}",
                 uid,
             )
             st.divider()
             current_nutrition_data = weekly_nutrition_result.get(
                 "current_nutrition_data", {}
             )
-            energy_values = current_nutrition_data.get("energy", [])
-            average_energy = (
-                sum(energy_values) / len(energy_values) if energy_values else 0
-            )
-            protein_ratio = weekly_nutrition_result.get(
-                "protein_ratio", 0
-            )  # このキーが結果に含まれているか確認
 
-            col1, _ = st.columns(2)  # レイアウト調整
+            previous_nutrition_data = weekly_nutrition_result.get(
+                "previous_nutrition_data", {}
+            )
+            current_energy_vals = current_nutrition_data.get("energy", [])
+            current_avg_energy = (
+                sum(current_energy_vals) / len(current_energy_vals)
+                if current_energy_vals
+                else 0
+            )
+            current_protein_ratio = weekly_nutrition_result.get(
+                "current_protein_ratio", 0
+            )
+            current_calories_out = weekly_activity_result.get(
+                "current_calories_out_mean", []
+            )
+            current_protein_mean = weekly_nutrition_result.get(
+                "current_protein_mean", 0
+            )
+            current_protein_ratio_by_activity = (
+                current_protein_mean * 4 / current_calories_out
+                if current_avg_energy > 0
+                else 0
+            )
+
+            previous_energy_vals = previous_nutrition_data.get("energy", [])
+            previous_avg_energy = (
+                sum(previous_energy_vals) / len(previous_energy_vals)
+                if previous_energy_vals
+                else 0
+            )
+            previous_protein_ratio = weekly_nutrition_result.get(
+                "previous_protein_ratio", 0
+            )
+            previous_calories_out = weekly_activity_result.get(
+                "previous_calories_out_mean", []
+            )
+            previous_protein_mean = weekly_nutrition_result.get(
+                "previous_protein_mean", 0
+            )
+            previous_protein_ratio_by_activity = (
+                previous_protein_mean * 4 / previous_calories_out
+                if previous_avg_energy > 0
+                else 0
+            )
+            col1, col2 = st.columns(2)
             with col1:
-                st.metric(label="今週のカロリー", value=f"{average_energy:.0f} kcal")
+                st.metric("今週のカロリー", f"{current_avg_energy:.0f} kcal")
                 st.metric(
-                    label="今週のタンパク質比率",
-                    value=f"{protein_ratio:.2%}",
-                    help="タンパク質のカロリー比率",
+                    "今週のタンパク質比率",
+                    f"{current_protein_ratio:.2%}",
+                    help="タンパク質カロリー / 総摂取カロリー",
                 )
-                st.write(
-                    "※ タンパク質のカロリー比率は、タンパク質のカロリーを総カロリーで割った値です。"
+                st.metric(
+                    "今週のタンパク質比率（活動ベース）",
+                    f"{current_protein_ratio_by_activity:.2%}",
+                    help="タンパク質カロリー / 総消費カロリー",
                 )
-                display_nutrition_data(
-                    "今週の栄養データ",
-                    current_nutrition_data,
-                    "weekly_current_nutrition",
+                display_nutrition_data("今週の栄養データ", current_nutrition_data)
+            with col2:
+                st.metric("今週のカロリー", f"{previous_avg_energy:.0f} kcal")
+                st.metric(
+                    "先週のタンパク質比率",
+                    f"{previous_protein_ratio:.2%}",
+                    help="タンパク質カロリー / 総カロリー",
                 )
+                st.metric(
+                    "先週のタンパク質比率（活動ベース）",
+                    f"{previous_protein_ratio_by_activity:.2%}",
+                    help="タンパク質カロリー / 総消費カロリー",
+                )
+                display_nutrition_data("先週の栄養データ", previous_nutrition_data)
     else:
         st.info('左上の"データを表示"ボタンを押して、分析を開始してください。')
 
 
+# ============================  プロファイラ  ===============================
 if __name__ == "__main__":
     profiler = cProfile.Profile()
     profiler.enable()
-
-    main()  # Streamlitアプリケーションのメイン関数を実行
-
+    main()
     profiler.disable()
 
-    # プロファイル結果をコンソールに出力
     s = io.StringIO()
-    # 'cumulative' (累積時間順)、'tottime' (正味時間順)、'ncalls' (呼び出し回数順) などでソート可能
-    sortby = "cumulative"
-    ps = pstats.Stats(profiler, stream=s).sort_stats(sortby)
-    ps.print_stats(50)  # 上位50件を表示（件数は適宜調整）
-
-    print("\n--- cProfile Stats (コンソールに出力) ---")
-    print(s.getvalue())
-    print("------------------------------------------\n")
-
-    # プロファイル結果をファイルに保存 (snakevizなどで可視化する場合)
-    # profiler_output_file = "profile_output.prof"
-    # profiler.dump_stats(profiler_output_file)
-    # print(f"プロファイル結果を {profiler_output_file} に保存しました。")
-    # print(f"snakeviz {profiler_output_file} で可視化できます。")
-
-    # 注意: StreamlitのUI上に直接プロファイル結果を表示する場合、
-    # main()関数が完了した後にしか表示されません。
-    # デバッグ目的であれば、上記コンソール出力やファイル保存がより確実です。
-    # if st.sidebar.checkbox("Show Profiler Stats", key="show_profiler_checkbox"):
-    # st.sidebar.text_area("Profiler Stats", s.getvalue(), height=600)
+    pstats.Stats(profiler, stream=s).sort_stats("cumulative").print_stats(50)
+    print("\n--- cProfile Stats ---\n" + s.getvalue())

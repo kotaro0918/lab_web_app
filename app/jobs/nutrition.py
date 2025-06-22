@@ -2,7 +2,6 @@ import os
 import sys
 from datetime import datetime
 import pandas as pd
-from google.cloud import bigquery
 
 # --------------------------------------------------
 # 自前ユーティリティ
@@ -109,7 +108,11 @@ def get_nutrition_by_user(user_id, start_date, end_date):
         carbohydrate.append(summary["carbohydrate"])
         cholesterol.append(summary["cholesterol"])
         dietary_fiber.append(summary["dietary_fiber"])
-
+    protein_ratio = [
+        protein * 4 / energy if energy > 0 else 0
+        for energy, protein in zip(energy, protein)
+    ]
+    print(f"Protein ratio: {protein_ratio}")
     return {
         "dates": dates,
         "meal_types": meal_types,
@@ -117,12 +120,8 @@ def get_nutrition_by_user(user_id, start_date, end_date):
         "created_dates": created_dates,
         "created_times": created_times,
         "energy": energy,
-        "water": water,
         "protein": protein,
-        "lipid": lipid,
-        "carbohydrate": carbohydrate,
-        "cholesterol": cholesterol,
-        "dietary_fiber": dietary_fiber,
+        "protein_ratio": protein_ratio,
     }
 
 

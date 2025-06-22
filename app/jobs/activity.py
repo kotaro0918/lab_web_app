@@ -16,6 +16,8 @@ def get_activity_by_user(user_id, start_date, end_date):
     SELECT 
         date,
         steps,
+        sedentary_minutes,
+        calories_out,
         (fairly_active_minutes + very_active_minutes * 2) as activity_time
     FROM `{ACTIVITY_TABLE}`
     WHERE id = '{user_id}' AND date BETWEEN '{start_date.date()}' AND '{end_date.date()}'
@@ -27,11 +29,21 @@ def get_activity_by_user(user_id, start_date, end_date):
     dates = []
     steps = []
     activity_minutes = []
+    sedentary_minutes = []
+    calorys_out = []
     for row in results:
         dates.append(row.date)
         steps.append(row.steps)
         activity_minutes.append(row.activity_time)
-    return {"dates": dates, "steps": steps, "activity_minutes": activity_minutes}
+        sedentary_minutes.append(row.sedentary_minutes)
+        calorys_out.append(row.calories_out)
+    return {
+        "dates": dates,
+        "steps": steps,
+        "activity_minutes": activity_minutes,
+        "sedentary_minutes": sedentary_minutes,
+        "calories_out": calorys_out,
+    }
 
 
 def get_random_activity_users(limit=7, min_records=7, start_date=None, end_date=None):

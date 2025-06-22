@@ -1,48 +1,79 @@
-import pandas as pd
-import numpy as np
 import os
 import sys
-from tqdm import tqdm
 from datetime import datetime
+import asyncio
+import pandas as pd
+import numpy as np
+from tqdm import tqdm
 
+# ルートパスを追加
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+
+# アプリ依存モジュール
 from app.jobs.nutrition import get_nutrition_by_user
 from app.gemini.generate_alert import generate_weekly_nutrition_alert
 
 
-def weekly_nutrition_pipeline(user_id, today):
+# --------------------------------------------------------------------------- #
+#                        非同期版 weekly_nutrition_pipeline
+# --------------------------------------------------------------------------- #
+async def weekly_nutrition_pipeline(
+    user_id: str, today: datetime, user_profile: str = ""
+) -> dict:
     """
-    ユーザーの栄養データを処理し、アラートを生成するパイプライン関数
-    Args:
-        user_id (str): ユーザーID
-        today (datetime): 処理日
-    Returns:
-        dict: 処理結果を含む辞書
+    指定ユーザーの 1 週間分の栄養データを取得し、Gemini でアラートを生成する。
+
+    Returns
+    -------
+    dict
+        - weekly_nutrition_alert : str
+        - current_nutrition_data : dict
+        - protein_ratio          : float
+        - user_id, date          : 入力値をそのまま保持
     """
-    # 1週間前の日付を計算
+    # ── 期間計算 ───────────────────────────────────────────────
     one_week_ago = today - pd.DateOffset(weeks=1)
+    two_week_ago = today - pd.DateOffset(weeks=2)
     end_date = today - pd.DateOffset(days=1)
 
-    current_nutrition_data = get_nutrition_by_user(user_id, one_week_ago, end_date)
-    # 平均値の計算
-    sum_energy = (
-        sum(current_nutrition_data["energy"])
-        if current_nutrition_data.get(
-            "energy"
-        )  # .get() を使ってキーが存在しない場合にも対応
+    # ── データ取得（同期関数をスレッドへ）────────────────────
+    current_nutrition_data = await asyncio.to_thread(
+        get_nutrition_by_user, user_id, one_week_ago, end_date
+    )
+    previous_nutrition_data = await asyncio.to_thread(
+        get_nutrition_by_user, user_id, two_week_ago, one_week_ago
+    )
+    # ── 集計 ───────────────────────────────────────────────
+    current_sum_energy = sum(current_nutrition_data.get("energy", []))
+    current_sum_protein = sum(current_nutrition_data.get("protein", []))
+    current_protein_ratio = (
+        (current_sum_protein * 4 / current_sum_energy) if current_sum_energy > 0 else 0
+    )
+
+    previous_sum_energy = sum(previous_nutrition_data.get("energy", []))
+    previous_sum_protein = sum(previous_nutrition_data.get("protein", []))
+    previous_protein_ratio = (
+        (previous_sum_protein * 4 / previous_sum_energy)
+        if previous_sum_energy > 0
         else 0
     )
-    sum_protein = (
-        sum(current_nutrition_data["protein"])  # np.sum から sum に変更 (どちらでも可)
-        if current_nutrition_data.get(
-            "protein"
-        )  # .get() を使ってキーが存在しない場合にも対応
-        else 0
+    # ── アラート生成（Gemini 呼び出しを await）────────────────
+    weekly_nutrition_alert = await generate_weekly_nutrition_alert(
+        current_nutrition_data, current_protein_ratio, user_profile
     )
-    protein_ratio = sum_protein * 4 / sum_energy if sum_energy > 0 else 0
-    # アラートの生成
-    weekly_nutrition_alert = generate_weekly_nutrition_alert(
-        current_nutrition_data, protein_ratio
+    # 0を除外したタンパク質の平均値を計算
+    current_protein_values = [
+        x for x in current_nutrition_data.get("protein", []) if x > 0
+    ]
+    current_protein_mean = (
+        np.mean(current_protein_values) if current_protein_values else 0
+    )
+
+    previous_protein_values = [
+        x for x in previous_nutrition_data.get("protein", []) if x > 0
+    ]
+    previous_protein_mean = (
+        np.mean(previous_protein_values) if previous_protein_values else 0
     )
 
     return {
@@ -50,14 +81,29 @@ def weekly_nutrition_pipeline(user_id, today):
         "date": today,
         "weekly_nutrition_alert": weekly_nutrition_alert,
         "current_nutrition_data": current_nutrition_data,
-        "protein_ratio": protein_ratio,
+        "current_protein_ratio": current_protein_ratio,
+        "current_protein_mean": current_protein_mean,
+        "previous_protein_mean": previous_protein_mean,
+        "previous_nutrition_data": previous_nutrition_data,
+        "previous_protein_ratio": previous_protein_ratio,
     }
 
 
-if __name__ == "__main__":
-    start_date = datetime(2024, 6, 1)
-    end_date = datetime(2024, 6, 7)
-    user_id = "ashita14977"  # 適切なユーザーIDを指定してください
-    # パイプラインを実行
-    result = weekly_nutrition_pipeline(user_id, end_date)
+# --------------------------------------------------------------------------- #
+#                               テスト実行ブロック
+# --------------------------------------------------------------------------- #
+async def _test():
+    """
+    - 固定ユーザー & 日付でパイプラインを実行
+    - 結果を表示
+    """
+    user_id = "ashita14977"  # 適切なユーザー ID に置き換えてください
+    today = datetime(2024, 6, 7)  # today を「週終わりの日付」として想定
+
+    result = await weekly_nutrition_pipeline(user_id, today)
+    print("=== Weekly Nutrition Pipeline Result ===")
     print(result)
+
+
+if __name__ == "__main__":
+    asyncio.run(_test())
