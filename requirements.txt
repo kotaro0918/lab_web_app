@@ -19,4 +19,8 @@ nest_asyncio==1.5.5
 
 plotly
 streamlit-webrtc
-numpy
+pyaudio
+taskgroup
+exceptiongroup
+av
+textual

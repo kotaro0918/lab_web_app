@@ -1,256 +1,199 @@
-# live_audio_chat.py  -- Gemini Live API × Streamlit-WebRTC 〈安定動作品＋debug〉
-# ──────────────────────────────────────────────────────────────────────────
-# - Mic 48 kHz/Opus → 16 kHz PCM で Gemini Live API に送信
-# - 0.5 s 無音で audio_stream_end を送信（ターン終了）
-# - 60 s 無操作で WebSocket を自動切断
-# - Mic / Player が生成された瞬間・recv() 呼び出し回数をロギング
-# - デバッグパネルに WebRTC state と Processor インスタンス ID を表示
-# - 依存: streamlit, streamlit-webrtc (≥0.50), google-generativeai, av, numpy,
-#        pyaudio, python-dotenv
+# -*- coding: utf-8 -*-
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-import os, asyncio, threading, queue, time, logging, pathlib
-import numpy as np
-import av
-import streamlit as st
-from dotenv import load_dotenv
+"""
+## Setup
+
+To install the dependencies for this script, run:
+
+brew install portaudio
+pip install -U google-genai pyaudio
+
+
+## API key
+
+Ensure the GOOGLE_API_KEY environment variable is set to the api-key
+you obtained from Google AI Studio.
+
+## Run
+
+To run the script:
+
+python Get_started_LiveAPI_NativeAudio.py
+
+
+Start talking to Gemini
+"""
+
+import asyncio
+import sys
+import traceback
+import os
+import logging
+import pyaudio
 from google import genai
-from google.genai import types
-from streamlit_webrtc import webrtc_streamer, WebRtcMode, AudioProcessorBase
+from dotenv import load_dotenv
 
-# ────────── logging ──────────────────────────────────────────────────────
-LOG_FILE = pathlib.Path("gemini_live.log")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler(), logging.FileHandler(LOG_FILE, mode="w")],
-)
-logger = logging.getLogger("gemini-live")
-logging.getLogger("google_genai._api_client").setLevel(logging.ERROR)  # warning 抑制
+# === Logging configuration ===
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# ────────── API キー ────────────────────────────────────────────────────
-load_dotenv("credential/.env")  # 無ければスキップ
-API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-if not API_KEY:
-    raise RuntimeError("GOOGLE_API_KEY または GEMINI_API_KEY を設定してください")
+# Load environment variables
+load_dotenv("credential/.env")
 
-# ────────── Gemini Live 設定 ────────────────────────────────────────────
-MODEL = "models/gemini-2.5-flash-preview-native-audio-dialog"
-client = genai.Client(api_key=API_KEY, http_options={"api_version": "v1beta"})
+# Compatibility for Python < 3.11
+if sys.version_info < (3, 11, 0):
+    import taskgroup, exceptiongroup
 
-CONFIG = types.LiveConnectConfig(
-    response_modalities=["AUDIO"],
-    speech_config=types.SpeechConfig(
-        voice_config=types.VoiceConfig(
-            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Zephyr")
+    asyncio.TaskGroup = taskgroup.TaskGroup
+    asyncio.ExceptionGroup = exceptiongroup.ExceptionGroup
+
+# Audio configuration
+FORMAT = pyaudio.paInt16
+CHANNELS = 1
+SEND_SAMPLE_RATE = 16000
+RECEIVE_SAMPLE_RATE = 24000
+CHUNK_SIZE = 2048
+
+pya = pyaudio.PyAudio()
+
+client = genai.Client()  # Requires GOOGLE_API_KEY as env variable
+
+MODEL = "gemini-2.5-flash-preview-native-audio-dialog"
+CONFIG = {
+    "response_modalities": ["AUDIO"],
+    "system_instruction": "You are a Japanese helpful assistant and answer in a friendly tone.",
+}
+
+
+class AudioLoop:
+    def __init__(self):
+        self.audio_in_queue = None
+        self.out_queue = None
+
+        self.session = None
+        self.audio_stream = None
+        self.last_played_frames = []
+
+        self.is_playing = asyncio.Event()  # 🔑 再生中フラグ
+
+    async def listen_audio(self):
+        mic_info = pya.get_default_input_device_info()
+        self.audio_stream = await asyncio.to_thread(
+            pya.open,
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=SEND_SAMPLE_RATE,
+            input=True,
+            input_device_index=mic_info["index"],
+            frames_per_buffer=CHUNK_SIZE,
         )
-    ),
-)
 
-SEND_SR, RECV_SR = 16_000, 24_000
-mic_q: queue.Queue[bytes] = queue.Queue(maxsize=400)
-spk_q: queue.Queue[bytes] = queue.Queue(maxsize=400)
+        kwargs = {"exception_on_overflow": False} if __debug__ else {}
 
+        while True:
+            data = await asyncio.to_thread(self.audio_stream.read, CHUNK_SIZE, **kwargs)
 
-# ────────── utils ───────────────────────────────────────────────────────
-def downsample_48k_to_16k(pcm48: bytes) -> bytes:
-    data = np.frombuffer(pcm48, np.int16)
-    return data[::3].tobytes()
+            if data in self.last_played_frames:
+                continue
 
+            if self.is_playing.is_set():
+                logger.debug("🎙️ マイク入力抑制中（再生中）")
+                continue
 
-def rms_db(pcm16: bytes) -> float:
-    if not pcm16:
-        return -120.0
-    sig = np.frombuffer(pcm16, np.int16).astype(np.float32)
-    rms = np.sqrt(np.mean(sig**2))
-    return 20 * np.log10(rms / 32768.0 + 1e-9)
+            await self.out_queue.put({"data": data, "mime_type": "audio/pcm"})
 
+    async def send_realtime(self):
+        while True:
+            msg = await self.out_queue.get()
+            await self.session.send_realtime_input(audio=msg)
 
-# ────────── Mic → Gemini ────────────────────────────────────────────────
-class MicSender(AudioProcessorBase):
-    silence = 0
+    async def receive_audio(self):
+        while True:
+            turn = self.session.receive()
+            async for response in turn:
+                if data := response.data:
+                    self.audio_in_queue.put_nowait(data)
+                    continue
+                if text := response.text:
+                    print(text, end="")
 
-    def __init__(self):
-        super().__init__()
-        logger.info(f"★★ MicSender constructed id={id(self)}")
+            # Clear residual audio queue to handle interruptions properly
+            while not self.audio_in_queue.empty():
+                self.audio_in_queue.get_nowait()
 
-    # async_processing=True では “frames” が list で渡る
-    def recv(self, frames):
-        if not isinstance(frames, list):
-            frames = [frames]
+    async def play_audio(self):
+        stream = await asyncio.to_thread(
+            pya.open,
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=RECEIVE_SAMPLE_RATE,
+            output=True,
+        )
 
-        self.__dict__.setdefault("cnt", 0)
-        self.__dict__["cnt"] += len(frames)
+        # 初期バッファが貯まるまで待機
+        while self.audio_in_queue.qsize() < 3:
+            await asyncio.sleep(0.01)
 
+        while True:
+            if self.audio_in_queue.empty():
+                await asyncio.sleep(0.01)
+                continue
+
+            self.is_playing.set()
+            logger.info("🔊 再生開始")
+
+            while not self.audio_in_queue.empty():
+                bytestream = await self.audio_in_queue.get()
+                self.last_played_frames.append(bytestream)
+
+                if len(self.last_played_frames) > 200:
+                    self.last_played_frames.pop(0)
+
+                await asyncio.to_thread(stream.write, bytestream)
+
+            logger.info("⏱️ 再生終了、0.5秒待機中")
+            await asyncio.sleep(0.5)
+
+            self.is_playing.clear()
+            logger.info("🎙️ マイク入力再開許可")
+
+    async def run(self):
         try:
-            for f in frames:
-                pcm48 = f.to_ndarray().tobytes()
-                pcm16 = downsample_48k_to_16k(pcm48)
-                mic_q.put_nowait(pcm16)
+            async with (
+                client.aio.live.connect(model=MODEL, config=CONFIG) as session,
+                asyncio.TaskGroup() as tg,
+            ):
+                self.session = session
 
-            lvl = rms_db(pcm16)  # 最後のフレームでレベル算出
-            MicSender.silence = 0 if lvl > -50 else MicSender.silence + 1
-            logger.info(
-                "▲ Mic  %5.1f dB  (%4d B, q=%d, id=%s, n=%d)",
-                lvl,
-                len(pcm16),
-                mic_q.qsize(),
-                id(self),
-                self.__dict__["cnt"],
-            )
-        except queue.Full:
-            logger.warning("Mic queue FULL")
-        except Exception:
-            logger.exception("MicSender error")
-        return frames  # プレビューにそのまま返却
+                self.audio_in_queue = asyncio.Queue()
+                self.out_queue = asyncio.Queue(maxsize=20)
 
+                tg.create_task(self.send_realtime())
+                tg.create_task(self.listen_audio())
+                tg.create_task(self.receive_audio())
+                tg.create_task(self.play_audio())
 
-# ────────── Gemini → Speaker ────────────────────────────────────────────
-class Player(AudioProcessorBase):
-    def __init__(self):
-        super().__init__()
-        logger.info(f"★★ Player constructed id={id(self)}")
-
-    def recv(self, frames):
-        if spk_q.empty():
-            return None
-
-        self.__dict__.setdefault("cnt", 0)
-        self.__dict__["cnt"] += 1
-
-        try:
-            pcm24 = spk_q.get_nowait()
-            logger.info(
-                "▶ Play %4d B  (q=%d, id=%s, n=%d)",
-                len(pcm24),
-                spk_q.qsize(),
-                id(self),
-                self.__dict__["cnt"],
-            )
-
-            samples = np.frombuffer(pcm24, np.int16)
-            frame = av.AudioFrame.from_ndarray(
-                samples.reshape(-1, 1), format="s16", layout="mono"
-            )
-            frame.sample_rate = RECV_SR
-            return frame
-        except Exception:
-            logger.exception("Player error")
-            return None
+        except asyncio.CancelledError:
+            pass
+        except ExceptionGroup as EG:
+            if self.audio_stream:
+                self.audio_stream.close()
+            traceback.print_exception(EG)
 
 
-# ────────── Gemini セッション ──────────────────────────────────────────
-IDLE_TIMEOUT = 60  # s
-
-
-async def live_session(stop_evt: asyncio.Event):
-    async with client.aio.live.connect(model=MODEL, config=CONFIG) as sess:
-        logger.info("Gemini session opened")
-        last_act = time.monotonic()
-
-        async def sender():
-            nonlocal last_act
-            while not stop_evt.is_set():
-                pcm16 = await asyncio.to_thread(mic_q.get)
-                last_act = time.monotonic()
-
-                await sess.send_realtime_input(
-                    audio=types.Blob(data=pcm16, mime_type="audio/pcm;rate=16000")
-                )
-                logger.info("↑ Sent %4d B", len(pcm16))
-
-                # 無音でターンを閉じる
-                if MicSender.silence >= 20 and time.monotonic() - last_act > 0.5:
-                    await sess.send_realtime_input(audio_stream_end=True)
-                    logger.info("↑ Sent audio_stream_end")
-                    MicSender.silence = 0
-
-        async def receiver():
-            nonlocal last_act
-            while not stop_evt.is_set():
-                turn = sess.receive()
-                async for resp in turn:
-                    last_act = time.monotonic()
-                    if resp.data:
-                        spk_q.put_nowait(resp.data)
-                        logger.info("↓ Recv %4d B", len(resp.data))
-                    if resp.text:
-                        logger.info("↓ Text %s", resp.text.strip())
-
-        async def watchdog():
-            while not stop_evt.is_set():
-                await asyncio.sleep(5)
-                if time.monotonic() - last_act > IDLE_TIMEOUT:
-                    logger.info("Idle %ds → close", IDLE_TIMEOUT)
-                    stop_evt.set()
-
-        await asyncio.gather(sender(), receiver(), watchdog())
-    logger.info("Gemini session closed")
-
-
-def start_live() -> asyncio.Event:
-    stop_evt = asyncio.Event()
-    loop = asyncio.new_event_loop()
-    threading.Thread(
-        target=loop.run_until_complete,
-        args=(live_session(stop_evt),),
-        daemon=True,
-    ).start()
-    return stop_evt
-
-
-# ────────── Streamlit UI ────────────────────────────────────────────────
-st.set_page_config(layout="wide", page_title="Gemini Live Chat")
-
-status = st.empty()
-status.success("🟡 接続待ち")
-
-col_mic, col_spk = st.columns(2)
-
-with col_mic:
-    st.caption("🎤 Mic")
-    ctx_mic = webrtc_streamer(
-        key="mic",
-        mode=WebRtcMode.SENDRECV,
-        audio_processor_factory=MicSender,
-        async_processing=True,  # ★ 非同期モード
-        media_stream_constraints={"audio": True, "video": False},
-        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
-        desired_playing_state=st.session_state.get("live_on", False),
-        audio_html_attrs={"controls": False},
-    )
-
-with col_spk:
-    st.caption("🔊 Speaker")
-    ctx_spk = webrtc_streamer(
-        key="spk",
-        mode=WebRtcMode.RECVONLY,
-        audio_processor_factory=Player,
-        async_processing=True,
-        audio_receiver_size=256,
-        media_stream_constraints={"audio": True, "video": False},
-        desired_playing_state=st.session_state.get("live_on", False),
-        audio_html_attrs={"controls": False},
-    )
-
-toggle = st.toggle("🎙  Live セッション ON / OFF", key="toggle")
-
-if toggle and not st.session_state.get("live_on"):
-    st.session_state.stop_evt = start_live()
-    st.session_state.live_on = True
-    status.success("🟢 会話中")
-
-elif not toggle and st.session_state.get("live_on"):
-    st.session_state.stop_evt.set()
-    st.session_state.live_on = False
-    status.warning("🔴 停止中")
-
-# ────────── デバッグパネル ────────────────────────────────────────────
-with st.expander("Debug", expanded=False):
-    st.write("Mic queue         :", mic_q.qsize())
-    st.write("Spk queue         :", spk_q.qsize())
-    st.write("silence_cnt       :", MicSender.silence)
-    st.write("live_on           :", st.session_state.get("live_on", False))
-    st.write("ctx_mic.state     :", getattr(ctx_mic, "state", None))
-    st.write("ctx_mic.processor :", id(getattr(ctx_mic, "processor", None)))
-    st.write("ctx_spk.state     :", getattr(ctx_spk, "state", None))
-    st.write("ctx_spk.processor :", id(getattr(ctx_spk, "processor", None)))
+if __name__ == "__main__":
+    loop = AudioLoop()
+    asyncio.run(loop.run())
