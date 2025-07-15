@@ -44,13 +44,33 @@ SEND_SAMPLE_RATE = 16000
 RECEIVE_SAMPLE_RATE = 24000
 CHANNELS = 1
 CHUNK_SIZE = 4096
-MODEL = "gemini-2.5-flash-preview-native-audio-dialog"
+MODEL = "gemini-2.5-flash-exp-native-audio-thinking-dialog"
 CONFIG = {
     "response_modalities": ["AUDIO"],
-    "system_instruction": "You are a Japanese helpful assistant and answer in a friendly tone.",
+    "system_instruction": "You are a Japanese helpful assistant and answer in a friendly tone.answer in Japanese. and shortly.",
 }
 
 client = genai.Client()
+
+
+# ★★★ 追加: オーディオデバイスのチェック ★★★
+def check_audio_devices():
+    """利用可能な入出力デバイスを確認し、なければエラーを発生させる"""
+    try:
+        sd.check_input_settings(samplerate=SEND_SAMPLE_RATE, channels=CHANNELS)
+        print("[✅] Default input device is OK.")
+    except Exception as e:
+        print(f"[❌] No suitable input device found: {e}")
+        raise RuntimeError("マイクが見つかりません。接続を確認してください。") from e
+
+    try:
+        sd.check_output_settings(samplerate=RECEIVE_SAMPLE_RATE, channels=CHANNELS)
+        print("[✅] Default output device is OK.")
+    except Exception as e:
+        print(f"[❌] No suitable output device found: {e}")
+        raise RuntimeError(
+            "スピーカーまたはヘッドホンが見つかりません。接続を確認してください。"
+        ) from e
 
 
 class AudioLoop:
@@ -60,86 +80,143 @@ class AudioLoop:
         self.text_queue = text_queue
         self.session: Optional[genai.aio.LiveSession] = None
         self.is_playing = asyncio.Event()
-        self.audio_in_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=1000)
-        self.out_queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=100)
+        # ★ 修正: out_queueは通常のキューでOK
+        self.out_queue: Queue[dict] = Queue(maxsize=1000)
+        self.audio_in_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=100)
         self.last_played_frames: list[bytes] = []
         self._stop_event = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
 
+    # ★★★ 修正点: listen_audioをコールバック方式に変更 ★★★
+    def _audio_callback(self, indata: np.ndarray, frames: int, time, status) -> None:
+        """sounddeviceから別スレッドで呼び出されるコールバック"""
+        if status:
+            print(f"[⚠️] Audio callback status: {status}")
+
+        audio_bytes = indata.tobytes()
+
+        # 再生中のエコーや無音を送信しない
+        if self.is_playing.is_set() or audio_bytes in self.last_played_frames:
+            return
+
+        try:
+            # out_queueは通常キューなのでput_nowaitでOK
+            self.out_queue.put_nowait(
+                {
+                    "data": audio_bytes,
+                    # ★★★ 修正: APIが要求するMIMEタイプ形式に変更 ★★★
+                    "mime_type": f"audio/pcm;rate={SEND_SAMPLE_RATE}",
+                }
+            )
+            print(f"[🎙] Captured and queued audio: {len(audio_bytes)} bytes")
+        except asyncio.QueueFull:
+            print("[⚠️] out_queue is full, dropping frame.")
+
     async def listen_audio(self) -> None:
-        print("[🎙] Starting microphone capture...")
-        with sd.InputStream(
+        """マイクキャプチャを開始し、停止イベントを待つ"""
+        print("[🎙] Starting microphone capture using callback...")
+        loop = asyncio.get_running_loop()
+
+        # InputStreamをコールバックモードで開く
+        stream = sd.InputStream(
             samplerate=SEND_SAMPLE_RATE,
             channels=CHANNELS,
             dtype="int16",
             blocksize=CHUNK_SIZE,
-        ):
-            while not self._stop_event.is_set():
-                data = sd.rec(
-                    CHUNK_SIZE,
-                    samplerate=SEND_SAMPLE_RATE,
-                    channels=CHANNELS,
-                    dtype="int16",
-                )
-                sd.wait()
-                audio_bytes = data.tobytes()
-                if self.is_playing.is_set() or audio_bytes in self.last_played_frames:
-                    continue
-                print(f"[🎙] Captured audio frame: {len(audio_bytes)} bytes")
-                await self.out_queue.put(
-                    {
-                        "data": audio_bytes,
-                        "mime_type": "audio/pcm;encoding=linear16;sample_rate_hz=16000",
-                    }
-                )
+            # loop.call_soon_threadsafeを使ってコールバックを登録
+            callback=lambda *args: loop.call_soon_threadsafe(
+                self._audio_callback, *args
+            ),
+        )
+        with stream:
+            # ストップイベントが発生するまで待機
+            await self._stop_event.wait()
+        print("[🎙] Microphone capture stopped.")
 
     async def send_realtime(self) -> None:
         print("[🚀] Starting realtime send loop...")
+        loop = asyncio.get_running_loop()
         while not self._stop_event.is_set():
-            print("[🚀] Waiting for audio frame...")
-            msg = await self.out_queue.get()
-            print(f"[🚀] Sending frame: {len(msg['data'])} bytes")
-            await self.session.send_realtime_input(audio=msg)
+            try:
+                # 通常キューから取得するためにrun_in_executorを使用
+                msg = await loop.run_in_executor(None, self.out_queue.get, True, 0.1)
+                print(f"[🚀] Sending frame: {len(msg['data'])} bytes")
+                if self.session:
+                    await self.session.send_realtime_input(audio=msg)
+            except Empty:
+                await asyncio.sleep(0.01)  # キューが空なら少し待つ
 
     async def receive_audio(self) -> None:
         print("[📥] Starting receive loop...")
         while not self._stop_event.is_set():
             try:
-                turn = await asyncio.wait_for(self.session.receive(), timeout=10)
-                async for resp in turn:
-                    if resp.data:
-                        print(f"[📥] Received audio frame: {len(resp.data)} bytes")
-                        await self.audio_in_queue.put(resp.data)
-                    if resp.text:
-                        print(f"[📝] Received text: {resp.text}")
-                        if self.text_queue:
-                            self.text_queue.put_nowait(resp.text)
+                async for resp in self.session.receive():
+                    if self._stop_event.is_set():
+                        break
+
+                    # ★★★ 修正: 応答の構造を判別して処理する ★★★
+                    if hasattr(resp, "parts"):
+                        # マルチパート応答の場合
+                        for part in resp.parts:
+                            if part.audio and part.audio.data:
+                                print(
+                                    f"[📥] Received audio frame: {len(part.audio.data)} bytes"
+                                )
+                                await self.audio_in_queue.put(part.audio.data)
+                            if part.text:
+                                print(f"[📝] Received text: {part.text}")
+                                if self.text_queue:
+                                    self.text_queue.put_nowait(part.text)
+                    else:
+                        # シンプルな応答の場合
+                        if resp.data:
+                            print(f"[📥] Received audio frame: {len(resp.data)} bytes")
+                            await self.audio_in_queue.put(resp.data)
+                        if resp.text:
+                            print(f"[📝] Received text: {resp.text}")
+                            if self.text_queue:
+                                self.text_queue.put_nowait(resp.text)
+
+                # ターンが正常に終了した場合
                 print("[📥] End of Gemini turn")
                 await self.audio_in_queue.put(self.END_TOKEN)
-            except asyncio.TimeoutError:
-                print("[⏰] No response from Gemini within timeout window.")
+
+            except asyncio.CancelledError:
+                # タスクがキャンセルされた場合は静かに終了
+                break
+            except Exception as e:
+                # 予期せぬエラーをキャッチしてログに出力
+                print(f"[❌] FATAL ERROR in receive_audio: {e}")
+                # エラーを再送出してTaskGroupに通知
+                raise
 
     async def play_audio(self) -> None:
         print("[🔊] Starting audio playback...")
-        with sd.OutputStream(
-            samplerate=RECEIVE_SAMPLE_RATE, channels=CHANNELS, dtype="int16"
-        ) as stream:
-            while self.audio_in_queue.qsize() < 2 and not self._stop_event.is_set():
-                await asyncio.sleep(0.01)
-            while not self._stop_event.is_set():
-                frame = await self.audio_in_queue.get()
-                if frame == self.END_TOKEN:
-                    print("[🔊] Received END_TOKEN — turn complete")
-                    await asyncio.sleep(0.3)
-                    self.is_playing.clear()
-                    continue
-                self.is_playing.set()
-                self.last_played_frames.append(frame)
-                if len(self.last_played_frames) > 400:
-                    self.last_played_frames.pop(0)
-                print(f"[🔊] Playing audio frame: {len(frame)} bytes")
-                np_frame = np.frombuffer(frame, dtype="int16")
-                stream.write(np_frame)
+        try:
+            with sd.OutputStream(
+                samplerate=RECEIVE_SAMPLE_RATE, channels=CHANNELS, dtype="int16"
+            ) as stream:
+                while self.audio_in_queue.qsize() < 2 and not self._stop_event.is_set():
+                    await asyncio.sleep(0.01)
+                while not self._stop_event.is_set():
+                    frame = await self.audio_in_queue.get()
+                    if frame == self.END_TOKEN:
+                        print("[🔊] Received END_TOKEN — turn complete")
+                        await asyncio.sleep(0.3)
+                        self.is_playing.clear()
+                        continue
+                    self.is_playing.set()
+                    self.last_played_frames.append(frame)
+                    if len(self.last_played_frames) > 400:
+                        self.last_played_frames.pop(0)
+                    print(f"[🔊] Playing audio frame: {len(frame)} bytes")
+                    np_frame = np.frombuffer(frame, dtype="int16")
+                    stream.write(np_frame)
+        # ★★★ 追加: play_audio内のエラーをキャッチしてログに出力 ★★★
+        except Exception as e:
+            print(f"[❌] FATAL ERROR in play_audio: {e}")
+            # エラーを再送出してTaskGroupに通知
+            raise
 
     async def run(self) -> None:
         print("[⚙️] Connecting to Gemini live session...")
@@ -183,10 +260,30 @@ text_placeholder = st.empty()
 def _start_chat() -> None:
     if st.session_state.app_state == "running":
         return
+
+    # ★★★ 追加: チャット開始前にデバイスをチェック ★★★
+    try:
+        check_audio_devices()
+    except RuntimeError as e:
+        st.error(str(e))
+        return
+
     loop = AudioLoop(text_queue=st.session_state.queue)
 
     def _runner() -> None:
-        asyncio.run(loop.run())
+        # ★★★ 修正: 詳細なエラーログを出力する ★★★
+        try:
+            asyncio.run(loop.run())
+        except exceptiongroup.ExceptionGroup as eg:
+            print("\n--- ERROR: ExceptionGroup caught in runner ---")
+            for i, exc in enumerate(eg.exceptions):
+                print(
+                    f"  Sub-exception {i+1}/{len(eg.exceptions)}: {type(exc).__name__}"
+                )
+                print(f"  {exc}")
+            print("---------------------------------------------\n")
+        except Exception as e:
+            print(f"\n--- ERROR: Unexpected exception in runner: {e} ---\n")
 
     thread = threading.Thread(target=_runner, daemon=True)
     thread.start()

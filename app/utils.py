@@ -137,21 +137,24 @@ class Gemini_TTS_Execution:
         return buf.getvalue()  # WAV ヘッダ + 音声
 
 
+VOICE_NAME = "Kore"
+MODEL_NAME = "gemini-2.5-flash-preview-tts"
+RATE_HZ = 24_000
+WIDTH = 2  # 16-bit PCM
+CHANNELS = 1
+
+
 class GeminiTTSStream:
-    """Vertex AI Gemini TTS を Live API で逐次ストリーミングする"""
+    """Gemini TTS を低遅延ストリームで再生・取得するユーティリティ"""
 
-    def __init__(
-        self,
-        model: str = "gemini-2.5-pro-preview-tts",
-        voice_name: str = "Kore",
-    ):
+    def __init__(self, voice_name: str = VOICE_NAME, model: str = MODEL_NAME):
         try:
-            self.client = genai.Client(api_key=_get_Gemini_API_key())
+            self._client = genai.Client(api_key=_get_Gemini_API_key())
         except Exception as e:
-            logging.error(f"Error initializing Gemini client: {e}")
+            logging.error(f"[GeminiTTSStream] init error: {e}")
             raise
-
-        self._config = types.LiveConnectConfig(
+        self._model = model
+        self._config = types.GenerateContentConfig(
             response_modalities=["AUDIO"],
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
@@ -161,18 +164,34 @@ class GeminiTTSStream:
                 )
             ),
         )
-        self._model = model
 
-    async def stream(self, text: str):
-        async with self.client.aio.live.connect(
+    # —────────────────────────────────────────────────────
+    # 同期ストリーム版: for chunk in stream_tts("text")
+    # —────────────────────────────────────────────────────
+    def stream_tts(self, text: str):
+        resp = self._client.models.generate_content(
             model=self._model,
+            contents=text,
             config=self._config,
-        ) as session:
-            await session.send(input=text, end_of_turn=True)
-            turn = session.receive()
-            async for resp in turn:
-                if resp.data:
-                    yield resp.data
+            stream=True,  # ★ ここがポイント
+        )
+        for chunk in resp:
+            if not chunk.candidates:
+                continue
+            yield chunk.candidates[0].content.parts[0].inline_data.data
+
+    # —────────────────────────────────────────────────────
+    # WAV エンコードしたバイト列を返したい場合（後段で st.audio 用）
+    # —────────────────────────────────────────────────────
+    def to_wav(self, pcm_iterable) -> bytes:
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(CHANNELS)
+            wf.setsampwidth(WIDTH)
+            wf.setframerate(RATE_HZ)
+            for pcm in pcm_iterable:
+                wf.writeframes(pcm)
+        return buf.getvalue()
 
 
 class GeminiChatExecution:
