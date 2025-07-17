@@ -1,328 +1,293 @@
 """
-Streamlit UI for real‑time voice chat with Gemini Live API
-=========================================================
-• Click **Start Conversation** to open your mic and begin talking.
+Streamlit UI for real‑time voice chat with Gemini Live API (WebRTC version)
+===========================================================================
+• This version runs entirely in the browser using streamlit-webrtc.
+• Click the "START" button in the component below to begin.
 • The assistant’s responses will be spoken back and simultaneously shown
-  as text below.
-• Click **Stop Conversation** to end the live session and release the mic.
+  as text.
+• Click "STOP" to end the session.
 
-> ⚠︎ Run this script locally. Most browsers/hosted services do not allow
-> low‑level microphone access from Python.
 > Ensure GOOGLE_API_KEY (or GEMINI_API_KEY) is set in credential/.env.
-
-### Key improvements vs. Google sample
-1. **No more truncated responses** – audio frames are *never* dropped and
-   the playback queue is not cleared mid‑turn.
-2. **Back‑pressure aware** – await queue.put() prevents overflow.
-3. **Turn‑end sentinel (__END__)** – precise detection of Gemini’s turn
-   completion; allows gapless playback without arbitrary sleeps.
-4. **Python 3.10 support** via taskgroup / exceptiongroup back‑ports.
 """
 
 from __future__ import annotations
 import asyncio
-import sys
-import threading
+import logging
+import threading  # ★ 追加
 from queue import Queue, Empty
-from typing import Optional
+import time  # ★ 追加
 
+import av
 import numpy as np
-import sounddevice as sd
 import streamlit as st
 from google import genai
+from streamlit_webrtc import AudioProcessorBase, WebRtcMode, webrtc_streamer
 
-# Python 3.10 対応: TaskGroup 互換
-if sys.version_info < (3, 11):
-    import taskgroup  # pip install taskgroup
-    import exceptiongroup  # pip install exceptiongroup
-
-    asyncio.TaskGroup = taskgroup.TaskGroup  # type: ignore[attr-defined]
-    asyncio.ExceptionGroup = exceptiongroup.ExceptionGroup  # type: ignore[attr-defined]
+# --- 基本設定 ---
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Constants
 SEND_SAMPLE_RATE = 16000
 RECEIVE_SAMPLE_RATE = 24000
-CHANNELS = 1
-CHUNK_SIZE = 4096
 MODEL = "gemini-2.5-flash-exp-native-audio-thinking-dialog"
 CONFIG = {
     "response_modalities": ["AUDIO"],
     "system_instruction": "You are a Japanese helpful assistant and answer in a friendly tone.answer in Japanese. and shortly.",
 }
 
-client = genai.Client()
+try:
+    client = genai.Client()
+except Exception as e:
+    st.error(f"Geminiクライアントの初期化に失敗しました: {e}")
+    st.stop()
 
 
-# ★★★ 追加: オーディオデバイスのチェック ★★★
-def check_audio_devices():
-    """利用可能な入出力デバイスを確認し、なければエラーを発生させる"""
-    try:
-        sd.check_input_settings(samplerate=SEND_SAMPLE_RATE, channels=CHANNELS)
-        print("[✅] Default input device is OK.")
-    except Exception as e:
-        print(f"[❌] No suitable input device found: {e}")
-        raise RuntimeError("マイクが見つかりません。接続を確認してください。") from e
-
-    try:
-        sd.check_output_settings(samplerate=RECEIVE_SAMPLE_RATE, channels=CHANNELS)
-        print("[✅] Default output device is OK.")
-    except Exception as e:
-        print(f"[❌] No suitable output device found: {e}")
-        raise RuntimeError(
-            "スピーカーまたはヘッドホンが見つかりません。接続を確認してください。"
-        ) from e
-
-
-class AudioLoop:
-    END_TOKEN: bytes = b"__END__"
-
-    def __init__(self, *, text_queue: Optional[Queue] = None):
-        self.text_queue = text_queue
-        self.session: Optional[genai.aio.LiveSession] = None
+# --- WebRTC オーディオプロセッサ ---
+class GeminiAudioProcessor(AudioProcessorBase):
+    # ★ 修正: __init__からtext_queueを削除
+    def __init__(self):
+        # ★ 修正: text_queueは後から設定されるのでNoneで初期化
+        self.text_queue: Queue | None = None
+        self.session: genai.aio.LiveSession | None = None
+        self.in_queue: asyncio.Queue[bytes] = asyncio.Queue()
+        self.out_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
         self.is_playing = asyncio.Event()
-        # ★ 修正: out_queueは通常のキューでOK
-        self.out_queue: Queue[dict] = Queue(maxsize=1000)
-        self.audio_in_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=100)
-        self.last_played_frames: list[bytes] = []
-        self._stop_event = asyncio.Event()
-        self._tasks: list[asyncio.Task] = []
+        self.is_speaking = False
 
-    # ★★★ 修正点: listen_audioをコールバック方式に変更 ★★★
-    def _audio_callback(self, indata: np.ndarray, frames: int, time, status) -> None:
-        """sounddeviceから別スレッドで呼び出されるコールバック"""
-        if status:
-            print(f"[⚠️] Audio callback status: {status}")
+        # ★★★ 修正: イベントループとそれを実行するスレッドをセットアップ ★★★
+        self.loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(target=self._run_loop, daemon=True)
+        self.thread.start()
+        self.task: asyncio.Task | None = None
 
-        audio_bytes = indata.tobytes()
+    def _run_loop(self):
+        """イベントループを別スレッドで実行する"""
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
 
-        # 再生中のエコーや無音を送信しない
-        if self.is_playing.is_set() or audio_bytes in self.last_played_frames:
-            return
+    def start(self):
+        """非同期タスクを開始する"""
+        if self.task is None or self.task.done():
+            # スレッドセーフな方法でタスクをスケジュールする
+            asyncio.run_coroutine_threadsafe(self._main_loop(), self.loop)
+            logger.info("Audio processor task started.")
 
-        try:
-            # out_queueは通常キューなのでput_nowaitでOK
-            self.out_queue.put_nowait(
-                {
-                    "data": audio_bytes,
-                    # ★★★ 修正: APIが要求するMIMEタイプ形式に変更 ★★★
-                    "mime_type": f"audio/pcm;rate={SEND_SAMPLE_RATE}",
-                }
-            )
-            print(f"[🎙] Captured and queued audio: {len(audio_bytes)} bytes")
-        except asyncio.QueueFull:
-            print("[⚠️] out_queue is full, dropping frame.")
-
-    async def listen_audio(self) -> None:
-        """マイクキャプチャを開始し、停止イベントを待つ"""
-        print("[🎙] Starting microphone capture using callback...")
-        loop = asyncio.get_running_loop()
-
-        # InputStreamをコールバックモードで開く
-        stream = sd.InputStream(
-            samplerate=SEND_SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype="int16",
-            blocksize=CHUNK_SIZE,
-            # loop.call_soon_threadsafeを使ってコールバックを登録
-            callback=lambda *args: loop.call_soon_threadsafe(
-                self._audio_callback, *args
-            ),
-        )
-        with stream:
-            # ストップイベントが発生するまで待機
-            await self._stop_event.wait()
-        print("[🎙] Microphone capture stopped.")
-
-    async def send_realtime(self) -> None:
-        print("[🚀] Starting realtime send loop...")
-        loop = asyncio.get_running_loop()
-        while not self._stop_event.is_set():
+    def stop(self):
+        """非同期タスクを停止する"""
+        if self.task:
+            self.task.cancel()
             try:
-                # 通常キューから取得するためにrun_in_executorを使用
-                msg = await loop.run_in_executor(None, self.out_queue.get, True, 0.1)
-                print(f"[🚀] Sending frame: {len(msg['data'])} bytes")
-                if self.session:
-                    await self.session.send_realtime_input(audio=msg)
-            except Empty:
-                await asyncio.sleep(0.01)  # キューが空なら少し待つ
-
-    async def receive_audio(self) -> None:
-        print("[📥] Starting receive loop...")
-        while not self._stop_event.is_set():
-            try:
-                async for resp in self.session.receive():
-                    if self._stop_event.is_set():
-                        break
-
-                    # ★★★ 修正: 応答の構造を判別して処理する ★★★
-                    if hasattr(resp, "parts"):
-                        # マルチパート応答の場合
-                        for part in resp.parts:
-                            if part.audio and part.audio.data:
-                                print(
-                                    f"[📥] Received audio frame: {len(part.audio.data)} bytes"
-                                )
-                                await self.audio_in_queue.put(part.audio.data)
-                            if part.text:
-                                print(f"[📝] Received text: {part.text}")
-                                if self.text_queue:
-                                    self.text_queue.put_nowait(part.text)
-                    else:
-                        # シンプルな応答の場合
-                        if resp.data:
-                            print(f"[📥] Received audio frame: {len(resp.data)} bytes")
-                            await self.audio_in_queue.put(resp.data)
-                        if resp.text:
-                            print(f"[📝] Received text: {resp.text}")
-                            if self.text_queue:
-                                self.text_queue.put_nowait(resp.text)
-
-                # ターンが正常に終了した場合
-                print("[📥] End of Gemini turn")
-                await self.audio_in_queue.put(self.END_TOKEN)
-
+                self.loop.run_until_complete(self.task)
             except asyncio.CancelledError:
-                # タスクがキャンセルされた場合は静かに終了
+                pass
+            finally:
+                self.task = None
+        self.loop.close()
+        logger.info("Audio processor task stopped.")
+
+    async def _main_loop(self):
+        """Geminiとの通信とデータ中継を行うメインループ"""
+        try:
+            async with client.aio.live.connect(model=MODEL, config=CONFIG) as session:
+                self.session = session
+                logger.info("Gemini session connected.")
+                # 送信タスクと受信タスクを並行実行
+                await asyncio.gather(self._sender(), self._receiver())
+        except Exception as e:
+            logger.error(f"Error in main loop: {e}")
+
+    async def _sender(self):
+        """マイクからの音声をGeminiに送信する"""
+        while True:
+            try:
+                chunk = await self.in_queue.get()
+                # ★★★ 修正: is_playingがセットされている間は送信しない ★★★
+                if self.session and not self.is_playing.is_set():
+                    await self.session.send_realtime_input(
+                        audio={
+                            "data": chunk,
+                            "mime_type": f"audio/pcm;rate={SEND_SAMPLE_RATE}",
+                        }
+                    )
+            except asyncio.CancelledError:
                 break
             except Exception as e:
-                # 予期せぬエラーをキャッチしてログに出力
-                print(f"[❌] FATAL ERROR in receive_audio: {e}")
-                # エラーを再送出してTaskGroupに通知
-                raise
+                logger.error(f"Sender error: {e}")
 
-    async def play_audio(self) -> None:
-        print("[🔊] Starting audio playback...")
-        try:
-            with sd.OutputStream(
-                samplerate=RECEIVE_SAMPLE_RATE, channels=CHANNELS, dtype="int16"
-            ) as stream:
-                while self.audio_in_queue.qsize() < 2 and not self._stop_event.is_set():
-                    await asyncio.sleep(0.01)
-                while not self._stop_event.is_set():
-                    frame = await self.audio_in_queue.get()
-                    if frame == self.END_TOKEN:
-                        print("[🔊] Received END_TOKEN — turn complete")
-                        await asyncio.sleep(0.3)
-                        self.is_playing.clear()
-                        continue
-                    self.is_playing.set()
-                    self.last_played_frames.append(frame)
-                    if len(self.last_played_frames) > 400:
-                        self.last_played_frames.pop(0)
-                    print(f"[🔊] Playing audio frame: {len(frame)} bytes")
-                    np_frame = np.frombuffer(frame, dtype="int16")
-                    stream.write(np_frame)
-        # ★★★ 追加: play_audio内のエラーをキャッチしてログに出力 ★★★
-        except Exception as e:
-            print(f"[❌] FATAL ERROR in play_audio: {e}")
-            # エラーを再送出してTaskGroupに通知
-            raise
+    async def _receiver(self):
+        """Geminiからの応答を受信し、再生キューとテキストキューに入れる"""
+        while True:
+            try:
+                if not self.session:
+                    await asyncio.sleep(0.1)
+                    continue
 
-    async def run(self) -> None:
-        print("[⚙️] Connecting to Gemini live session...")
-        async with client.aio.live.connect(model=MODEL, config=CONFIG) as session:
-            self.session = session
-            print("[✅] Connected to Gemini")
-            async with asyncio.TaskGroup() as tg:
-                self._tasks.extend(
-                    [
-                        tg.create_task(self.listen_audio()),
-                        tg.create_task(self.send_realtime()),
-                        tg.create_task(self.receive_audio()),
-                        tg.create_task(self.play_audio()),
-                    ]
-                )
+                async for resp in self.session.receive():
+                    # ★★★ 修正: 応答オブジェクトの構造を柔軟に処理 ★★★
+                    def process_part(part):
+                        if part.audio and part.audio.data:
+                            self.out_queue.put_nowait(part.audio.data)
+                        if self.text_queue and part.text:
+                            self.text_queue.put_nowait(part.text)
 
-    def stop(self) -> None:
-        print("[🛑] Stopping audio loop")
-        self._stop_event.set()
-        for t in self._tasks:
-            t.cancel()
+                    if hasattr(resp, "parts") and resp.parts:
+                        for part in resp.parts:
+                            process_part(part)
+                    else:
+                        # partsがない場合、応答オブジェクト自体をチェック
+                        process_part(resp)
+
+                # ターンの終わりにNoneを入れて再生の区切りとする
+                self.out_queue.put_nowait(None)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Receiver error: {e}")
+
+    async def recv_queued(self, frames: list[av.AudioFrame]) -> list[av.AudioFrame]:
+        """ブラウザからのマイク音声フレームを処理する"""
+        # ★★★ 修正: is_playingがセットされている間はマイク入力を無視 ★★★
+        if self.is_playing.is_set():
+            return []
+
+        # フレームをリサンプリングして16kHz, モノラル, 16bit PCMに変換
+        resampler = av.AudioResampler(
+            format="s16", layout="mono", rate=SEND_SAMPLE_RATE
+        )
+        processed_frames = []
+        for frame in frames:
+            processed_frames.extend(resampler.resample(frame))
+
+        if not processed_frames:
+            return []  # ★★★ 修正: Noneではなく空のリストを返す ★★★
+
+        # 変換したフレームをバイトデータに変換して入力キューに入れる
+        pcm_s16 = np.hstack([p.to_ndarray() for p in processed_frames])
+        await self.in_queue.put(pcm_s16.tobytes())
+        # recv_queued は何も返す必要がないので、空のリストを返す
+        return []
+
+    async def send_queued(self) -> list[av.AudioFrame]:
+        """再生キューの音声データをブラウザに送る"""
+        if not self.is_speaking:
+            # 最初のフレームが来るまで待つ
+            first_frame = await self.out_queue.get()
+            if first_frame is None:
+                self.is_playing.clear()
+                return []  # ★ 修正: Noneではなく空のリストを返す
+            self.is_playing.set()
+            self.is_speaking = True
+            chunk = first_frame
+        else:
+            try:
+                # タイムアウト付きでキューから取得
+                chunk = await asyncio.wait_for(self.out_queue.get(), timeout=0.1)
+                if chunk is None:
+                    self.is_speaking = False
+                    self.is_playing.clear()
+                    return []  # ★ 修正: Noneではなく空のリストを返す
+            except asyncio.TimeoutError:
+                return []  # ★ 修正: 無音を返す場合も空のリスト
+
+        # 受け取ったPCMデータをav.AudioFrameに変換して返す
+        np_frame = np.frombuffer(chunk, dtype=np.int16)
+        new_frame = av.AudioFrame.from_ndarray(
+            np_frame.reshape(1, -1), format="s16", layout="mono"
+        )
+        new_frame.sample_rate = RECEIVE_SAMPLE_RATE
+        return [new_frame]  # ★ 修正: フレームをリストに入れて返す
+
+    def on_ended(self):
+        """WebRTCセッション終了時に呼ばれる"""
+        self.stop()
 
 
-# ─────────────────────────────────────────────
-# Streamlit UI
-# ─────────────────────────────────────────────
-st.set_page_config(page_title="Gemini Voice Chat", page_icon="🗣️")
-st.title("🗣️ Gemini Voice Chat Demo")
+# --- Streamlit UI ---
+st.set_page_config(page_title="Gemini Voice Chat (WebRTC)", page_icon="🌐")
+st.title("🌐 Gemini Voice Chat Demo (WebRTC)")
+st.markdown("**Start**ボタンを押してマイクの使用を許可し、会話を始めてください。")
 
-if "app_state" not in st.session_state:
-    st.session_state.app_state = "stopped"
-    st.session_state.loop_thread: Optional[threading.Thread] = None
-    st.session_state.audio_loop: Optional[AudioLoop] = None
+# ★★★ 修正: st.session_state の初期化をスクリプトの先頭に移動 ★★★
+if "text_buffer" not in st.session_state:
     st.session_state.text_buffer = ""
-    st.session_state.queue: Queue[str] = Queue()
+if "processor_started" not in st.session_state:
+    st.session_state.processor_started = False
+if "audio_processor" not in st.session_state:
+    st.session_state.audio_processor = None
+if "webrtc_ctx" not in st.session_state:
+    st.session_state.webrtc_ctx = None
 
-status_placeholder = st.empty()
+# --- メインロジック ---
 text_placeholder = st.empty()
+audio_placeholder = st.empty()
+
+# ★★★ 修正: UIとロジックを分離 ★★★
+col1, col2 = st.columns([1, 1])
+with col1:
+    start_button = st.button(
+        "▶️ Start Conversation", key="start", use_container_width=True
+    )
+with col2:
+    stop_button = st.button("⏹️ Stop Conversation", key="stop", use_container_width=True)
+
+if start_button:
+    st.session_state.webrtc_ctx = webrtc_streamer(
+        key="gemini-webrtc",
+        mode=WebRtcMode.SENDONLY,  # ★★★ 修正: SENDONLYモードに変更
+        audio_processor_factory=GeminiAudioProcessor,
+        media_stream_constraints={"video": False, "audio": True},
+        async_processing=True,
+    )
+    st.rerun()
+
+if stop_button and st.session_state.webrtc_ctx:
+    st.session_state.webrtc_ctx.stop()
+    st.session_state.webrtc_ctx = None
+    st.session_state.audio_processor = None
+    st.session_state.processor_started = False
+    st.session_state.text_buffer = ""
+    st.rerun()
 
 
-def _start_chat() -> None:
-    if st.session_state.app_state == "running":
-        return
+if st.session_state.webrtc_ctx and st.session_state.webrtc_ctx.state.playing:
+    status_placeholder = st.success(
+        "会話が実行中です… マイクに向かって話してください。"
+    )
+    if not st.session_state.processor_started:
+        st.session_state.audio_processor = st.session_state.webrtc_ctx.audio_processor
+        st.session_state.processor_started = True
 
-    # ★★★ 追加: チャット開始前にデバイスをチェック ★★★
-    try:
-        check_audio_devices()
-    except RuntimeError as e:
-        st.error(str(e))
-        return
-
-    loop = AudioLoop(text_queue=st.session_state.queue)
-
-    def _runner() -> None:
-        # ★★★ 修正: 詳細なエラーログを出力する ★★★
+    processor = st.session_state.audio_processor
+    if processor:
         try:
-            asyncio.run(loop.run())
-        except exceptiongroup.ExceptionGroup as eg:
-            print("\n--- ERROR: ExceptionGroup caught in runner ---")
-            for i, exc in enumerate(eg.exceptions):
-                print(
-                    f"  Sub-exception {i+1}/{len(eg.exceptions)}: {type(exc).__name__}"
-                )
-                print(f"  {exc}")
-            print("---------------------------------------------\n")
-        except Exception as e:
-            print(f"\n--- ERROR: Unexpected exception in runner: {e} ---\n")
+            # ★★★ 修正: 音声再生ロジック ★★★
+            audio_chunk = processor.out_queue.get_nowait()
+            if audio_chunk is not None:
+                # 再生用の完全な音声データを結合
+                if "audio_buffer" not in st.session_state:
+                    st.session_state.audio_buffer = b""
+                st.session_state.audio_buffer += audio_chunk
+            else:
+                # Noneが来たら再生してバッファをクリア
+                if "audio_buffer" in st.session_state and st.session_state.audio_buffer:
+                    audio_placeholder.audio(
+                        st.session_state.audio_buffer, sample_rate=RECEIVE_SAMPLE_RATE
+                    )
+                    st.session_state.audio_buffer = b""  # バッファをクリア
+        except Empty:
+            pass  # キューが空なら何もしない
 
-    thread = threading.Thread(target=_runner, daemon=True)
-    thread.start()
-    st.session_state.loop_thread = thread
-    st.session_state.audio_loop = loop
-    st.session_state.app_state = "running"
+        try:
+            # ★★★ 修正: テキスト表示ロジック ★★★
+            text_chunk = processor.text_queue.get_nowait()
+            st.session_state.text_buffer += text_chunk
+        except Empty:
+            pass
 
-
-def _stop_chat() -> None:
-    if st.session_state.app_state != "running":
-        return
-    st.session_state.audio_loop.stop()  # type: ignore
-    st.session_state.app_state = "stopped"
-
-
-with st.sidebar:
-    st.header("Controls")
-    st.button(
-        "▶️ Start Conversation",
-        on_click=_start_chat,
-        disabled=st.session_state.app_state == "running",
+    text_placeholder.markdown(
+        st.session_state.text_buffer or "_会話の履歴はここに表示されます…_"
     )
-    st.button(
-        "⏹️ Stop Conversation",
-        on_click=_stop_chat,
-        disabled=st.session_state.app_state != "running",
-    )
-    st.markdown("---")
-
-if st.session_state.app_state == "running":
-    status_placeholder.success("Conversation running… Speak into your microphone.")
+    st.rerun()
 else:
-    status_placeholder.info("Click **Start Conversation** to begin.")
-
-try:
-    while True:
-        chunk = st.session_state.queue.get_nowait()
-        st.session_state.text_buffer += chunk
-except Empty:
-    pass
-
-text_placeholder.markdown(st.session_state.text_buffer or "_No transcript yet…_")
+    status_placeholder = st.info("「Start Conversation」を押して会話を開始します。")

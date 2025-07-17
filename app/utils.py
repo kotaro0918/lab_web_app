@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 import pandas as pd
 
 
-MODEL = "gemini-2.5-flash-preview-04-17"
+MODEL = "gemini-2.5-flash"
 TEST_TABLE = "tu-connectedlife.fitbit.activity_summary"
 
 
